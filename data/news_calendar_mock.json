@@ -1,0 +1,17 @@
+[
+  {
+    "datetime_iso": "2026-01-21T16:00:00+01:00",
+    "impact": "HIGH",
+    "title": "FOMC Minutes"
+  },
+  {
+    "datetime_iso": "2026-01-21T18:30:00+01:00",
+    "impact": "MED",
+    "title": "US Initial Jobless Claims"
+  },
+  {
+    "datetime_iso": "2026-01-21T20:00:00+01:00",
+    "impact": "LOW",
+    "title": "EUR Consumer Confidence"
+  }
+]

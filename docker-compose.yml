@@ -1,0 +1,27 @@
+services:
+  api:
+    build: .
+    container_name: trader-assistant-api
+    env_file:
+      - .env.local
+    ports:
+      - "8000:8000"
+    volumes:
+      - sqlite_data:/data
+    restart: unless-stopped
+
+  n8n:
+    image: n8nio/n8n:1.68.1
+    profiles: ["n8n"]
+    container_name: trader-assistant-n8n
+    ports:
+      - "5678:5678"
+    environment:
+      - N8N_BASIC_AUTH_ACTIVE=false
+    volumes:
+      - n8n_data:/home/node/.n8n
+    restart: unless-stopped
+
+volumes:
+  sqlite_data:
+  n8n_data:
