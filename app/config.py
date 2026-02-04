@@ -16,7 +16,14 @@ class Settings(BaseModel):
     tf_signal: str = Field(default="M15", validation_alias="TF_SIGNAL")
     tf_context: str = Field(default="H1", validation_alias="TF_CONTEXT")
     spread_max: float = Field(default=20.0, validation_alias="SPREAD_MAX")
+    hard_spread_max_points: float = Field(default=40.0, validation_alias="HARD_SPREAD_MAX_POINTS")
+    soft_spread_start_points: float = Field(default=20.0, validation_alias="SOFT_SPREAD_START_POINTS")
+    soft_spread_max_penalty: int = Field(default=30, validation_alias="SOFT_SPREAD_MAX_PENALTY")
+    hard_spread_max_ratio: float = Field(default=0.12, validation_alias="HARD_SPREAD_MAX_RATIO")
+    soft_spread_start_ratio: float = Field(default=0.06, validation_alias="SOFT_SPREAD_START_RATIO")
     atr_max: float = Field(default=2.0, validation_alias="ATR_MAX")
+    sl_max_atr_multiple: float = Field(default=1.5, validation_alias="SL_MAX_ATR_MULTIPLE")
+    sl_max_points: float = Field(default=25.0, validation_alias="SL_MAX_POINTS")
     rr_min: float = Field(default=2.0, validation_alias="RR_MIN")
     cooldown_minutes: int = Field(default=20, validation_alias="COOLDOWN_MINUTES")
     daily_budget_amount: float = Field(default=20.0, validation_alias="DAILY_BUDGET_AMOUNT")
@@ -80,6 +87,19 @@ class Settings(BaseModel):
     coach_language: str = Field(default="fr", validation_alias="COACH_LANGUAGE")
     coach_mode: str = Field(default="pro", validation_alias="COACH_MODE")
     fx_eurusd: float = Field(default=1.08, validation_alias="FX_EURUSD")
+
+    # Outcome agent
+    outcome_agent_enabled: bool = Field(default=False, validation_alias="OUTCOME_AGENT_ENABLED")
+    outcome_agent_interval_sec: int = Field(default=300, validation_alias="OUTCOME_AGENT_INTERVAL_SEC")
+    outcome_agent_lookback_hours: int = Field(default=24, validation_alias="OUTCOME_AGENT_LOOKBACK_HOURS")
+    outcome_agent_wait_minutes: int = Field(default=10, validation_alias="OUTCOME_AGENT_WAIT_MINUTES")
+    outcome_agent_min_age_hours: int = Field(default=24, validation_alias="OUTCOME_AGENT_MIN_AGE_HOURS")
+    outcome_agent_run_only_during_market_close: bool = Field(
+        default=True, validation_alias="OUTCOME_AGENT_RUN_ONLY_DURING_MARKET_CLOSE"
+    )
+    outcome_agent_horizon_minutes: int = Field(default=180, validation_alias="OUTCOME_AGENT_HORIZON_MINUTES")
+    outcome_agent_candle_tf: str = Field(default="M1", validation_alias="OUTCOME_AGENT_CANDLE_TF")
+    outcome_agent_max_per_loop: int = Field(default=20, validation_alias="OUTCOME_AGENT_MAX_PER_LOOP")
 
     def model_post_init(self, __context: Optional[dict]) -> None:  # type: ignore[override]
         self.data_provider = str(self.data_provider).lower()

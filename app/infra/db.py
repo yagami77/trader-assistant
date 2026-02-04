@@ -57,6 +57,47 @@ def init_db() -> None:
         """
     )
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(signals)").fetchall()}
+    if "ts_local" in columns:
+        conn.execute("DROP TABLE signals")
+        conn.execute(
+            """
+            CREATE TABLE signals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts_utc TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                tf_signal TEXT NOT NULL,
+                tf_context TEXT NOT NULL,
+                status TEXT NOT NULL,
+                blocked_by TEXT,
+                direction TEXT,
+                entry REAL,
+                sl REAL,
+                tp1 REAL,
+                tp2 REAL,
+                rr_tp2 REAL,
+                score_total INTEGER,
+                score_effective INTEGER,
+                telegram_sent INTEGER,
+                telegram_error TEXT,
+                telegram_latency_ms INTEGER,
+                alert_key TEXT,
+                score_rules_json TEXT,
+                ai_enabled INTEGER,
+                ai_output_json TEXT,
+                ai_model TEXT,
+                ai_input_tokens INTEGER,
+                ai_output_tokens INTEGER,
+                ai_cost_usd REAL,
+                decision_packet_json TEXT,
+                signal_key TEXT,
+                reasons_json TEXT,
+                message TEXT,
+                data_latency_ms INTEGER,
+                ai_latency_ms INTEGER
+            )
+            """
+        )
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(signals)").fetchall()}
     if "score_effective" not in columns:
         conn.execute("ALTER TABLE signals ADD COLUMN score_effective INTEGER")
     if "telegram_sent" not in columns:
@@ -111,6 +152,44 @@ def init_db() -> None:
         );
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS signal_outcomes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            signal_id INTEGER UNIQUE,
+            ts_checked_utc TEXT,
+            outcome_status TEXT,
+            outcome_reason TEXT,
+            hit_tp1 INTEGER,
+            hit_tp2 INTEGER,
+            hit_sl INTEGER,
+            max_favorable_points REAL,
+            max_adverse_points REAL,
+            pnl_points REAL,
+            horizon_minutes INTEGER,
+            price_path_start_ts INTEGER,
+            price_path_end_ts INTEGER
+        );
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_signal_outcomes_signal_id ON signal_outcomes(signal_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_signal_outcomes_ts_checked ON signal_outcomes(ts_checked_utc)"
+    )
+    conn.commit()
+    conn.close()
+
+
+def truncate_all_tables() -> None:
+    """Vide toutes les tables (nouveau suivi propre)."""
+    conn = get_conn()
+    for table in ("signals", "signal_outcomes", "state", "ai_usage_daily", "ai_messages"):
+        try:
+            conn.execute(f"DELETE FROM {table}")
+        except sqlite3.OperationalError:
+            pass  # table may not exist
     conn.commit()
     conn.close()
 
@@ -215,6 +294,41 @@ def insert_ai_message(ts_utc: str, symbol: str, decision: str, text: str, meta_j
         VALUES (?, ?, ?, ?, ?)
         """,
         (ts_utc, symbol, decision, text, meta_json),
+    )
+    conn.commit()
+    conn.close()
+
+
+def upsert_signal_outcome(payload: Dict[str, Any]) -> None:
+    conn = get_conn()
+    conn.execute(
+        """
+        INSERT INTO signal_outcomes (
+            signal_id, ts_checked_utc, outcome_status, outcome_reason,
+            hit_tp1, hit_tp2, hit_sl,
+            max_favorable_points, max_adverse_points, pnl_points,
+            horizon_minutes, price_path_start_ts, price_path_end_ts
+        ) VALUES (
+            :signal_id, :ts_checked_utc, :outcome_status, :outcome_reason,
+            :hit_tp1, :hit_tp2, :hit_sl,
+            :max_favorable_points, :max_adverse_points, :pnl_points,
+            :horizon_minutes, :price_path_start_ts, :price_path_end_ts
+        )
+        ON CONFLICT(signal_id) DO UPDATE SET
+            ts_checked_utc=excluded.ts_checked_utc,
+            outcome_status=excluded.outcome_status,
+            outcome_reason=excluded.outcome_reason,
+            hit_tp1=excluded.hit_tp1,
+            hit_tp2=excluded.hit_tp2,
+            hit_sl=excluded.hit_sl,
+            max_favorable_points=excluded.max_favorable_points,
+            max_adverse_points=excluded.max_adverse_points,
+            pnl_points=excluded.pnl_points,
+            horizon_minutes=excluded.horizon_minutes,
+            price_path_start_ts=excluded.price_path_start_ts,
+            price_path_end_ts=excluded.price_path_end_ts
+        """,
+        payload,
     )
     conn.commit()
     conn.close()

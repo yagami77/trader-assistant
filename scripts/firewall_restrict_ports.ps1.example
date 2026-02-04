@@ -1,0 +1,16 @@
+# Etape OPTIONNELLE - Restreindre 8080/8081 a une IP uniquement
+# NE PAS EXECUTER sans modifier $MyIP avec votre adresse IP publique
+# Executer en Administrateur
+
+$MyIP = "VOTRE_IP_PUBLIQUE"  # ex: "203.0.113.50"
+
+# Supprimer regles existantes si vous voulez repartir de zero
+# Remove-NetFirewallRule -DisplayName "MT5 Bridge 8080" -ErrorAction SilentlyContinue
+# Remove-NetFirewallRule -DisplayName "Trader Core 8081" -ErrorAction SilentlyContinue
+
+# Bloquer tout le monde puis autoriser uniquement votre IP
+New-NetFirewallRule -DisplayName "MT5 Bridge 8080" -Direction Inbound -LocalPort 8080 -Protocol TCP -Action Allow -RemoteAddress $MyIP -ErrorAction SilentlyContinue
+New-NetFirewallRule -DisplayName "Trader Core 8081" -Direction Inbound -LocalPort 8081 -Protocol TCP -Action Allow -RemoteAddress $MyIP -ErrorAction SilentlyContinue
+
+# Note: Une regle Allow pour une IP precise n'est pas suffisante si une regle plus permissive existe.
+# Verifier avec: Get-NetFirewallRule | Where-Object { $_.DisplayName -match "8080|8081" }

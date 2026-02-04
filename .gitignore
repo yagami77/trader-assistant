@@ -1,0 +1,30 @@
+# Environnement et secrets
+.env
+.env.local
+.env.*.local
+
+# Virtualenv
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Données et état runtime
+data/runner_state.json
+data/*.db
+data/*.sqlite
+logs/
+
+# Fichiers temporaires / debug
+init_db_debug.py
+query

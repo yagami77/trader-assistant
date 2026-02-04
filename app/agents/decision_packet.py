@@ -10,7 +10,7 @@ from app.agents.context_agent import get_context_summary
 from app.agents.news_agent import get_lock
 from app.agents.news_impact_agent import build_news_impact_summary
 from app.engines.news_timing import compute_news_timing
-from app.engines.setup_engine import detect_setups
+from app.engines.setup_engine import detect_setups, infer_bias_from_candles
 
 
 SESSION_WINDOWS = [
@@ -74,6 +74,12 @@ def _parse_timestamp(value: object) -> Optional[datetime]:
     return None
 
 
+def _normalize_atr(atr_price: float, price_ref: float) -> float:
+    if price_ref <= 0:
+        return atr_price
+    return (atr_price / price_ref) * 100
+
+
 def build_decision_packet(provider, symbol: str) -> DecisionPacket:
     settings = get_settings()
     now_utc = provider.get_server_time()
@@ -86,10 +92,19 @@ def build_decision_packet(provider, symbol: str) -> DecisionPacket:
         settings.market_close_end,
     )
     spread = provider.get_spread(symbol)
-    atr = 1.1
-    bias = Bias.up
+    specs = provider.get_symbol_specs(symbol)
+    tick_size = float(specs.get("tick_size") or 0.0)
     candles = provider.get_candles(symbol, settings.tf_signal, 50)
-    setup = detect_setups(candles)
+    candles_h1 = provider.get_candles(symbol, settings.tf_context, 30)
+    bias_h1 = infer_bias_from_candles(candles_h1) if candles_h1 else Bias.range
+
+    setup = detect_setups(
+        candles,
+        tick_size,
+        settings.sl_max_atr_multiple,
+        settings.sl_max_points,
+    )
+    atr_metric = _normalize_atr(setup.atr, setup.entry)
     news_lock, next_event, provider_ok, raw_count, lock_window = get_lock(
         now_utc,
         settings.news_lock_high_pre_min,
@@ -160,9 +175,12 @@ def build_decision_packet(provider, symbol: str) -> DecisionPacket:
         spread=spread,
         news_impact_summary=news_impact_summary,
         spread_max=settings.spread_max,
-        atr=atr,
+        spread_ratio=None,
+        penalties={},
+        atr=atr_metric,
         atr_max=settings.atr_max,
-        bias_h1=bias,
+        bias_h1=bias_h1,
+        direction=setup.direction,
         setups_detected=setup.setups,
         proposed_entry=entry,
         sl=sl,
@@ -170,6 +188,7 @@ def build_decision_packet(provider, symbol: str) -> DecisionPacket:
         tp2=tp2,
         rr_tp2=rr_tp2,
         rr_min=settings.rr_min,
+        tick_size=tick_size,
         score_rules=0,
         reasons_rules=[],
         sources_used=sources_used,
@@ -227,6 +246,8 @@ def build_fallback_packet(symbol: str, now_utc: Optional[datetime] = None) -> De
         news_state={},
         spread=settings.spread_max + 1.0,
         spread_max=settings.spread_max,
+        spread_ratio=None,
+        penalties={},
         atr=settings.atr_max + 1.0,
         atr_max=settings.atr_max,
         bias_h1=Bias.range,
@@ -237,6 +258,7 @@ def build_fallback_packet(symbol: str, now_utc: Optional[datetime] = None) -> De
         tp2=0.0,
         rr_tp2=0.0,
         rr_min=settings.rr_min,
+        tick_size=0.0,
         score_rules=0,
         reasons_rules=[],
         sources_used=[],
@@ -250,4 +272,5 @@ def build_fallback_packet(symbol: str, now_utc: Optional[datetime] = None) -> De
             "ts_paris": now_paris.isoformat(),
         },
         data_latency_ms=9999,
+        direction="BUY",
     )

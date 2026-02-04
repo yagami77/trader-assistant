@@ -41,6 +41,16 @@ from app.models import (
 from app.providers import get_provider
 from app.engines.scorer import score_packet
 from app.state_repo import get_today_state, is_cooldown_ok, update_on_decision
+from app.api.runner import router as runner_router
+from app.api.outcomes import router as outcomes_router
+
+# Patterns à bloquer (anti-scanners) - path.startswith ou path ==
+_BLOCKED_PREFIXES = ("/.env", "/.git", "/.aws", "/.ssh", "/.htaccess", "/.htpasswd")
+_BLOCKED_EXACT = (
+    "/wp-config.php", "/docker-compose.yml", "/config.json",
+    "/phpmyadmin", "/admin.php", "/.env", "/.git",
+)
+
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
@@ -58,6 +68,29 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="Trader Assistant API", version="0.1.0", lifespan=lifespan)
+app.include_router(runner_router)
+app.include_router(outcomes_router)
+
+
+@app.middleware("http")
+async def block_scanner_paths(request, call_next):
+    path = request.url.path
+    path_lower = path.lower()
+    for p in _BLOCKED_PREFIXES:
+        if path_lower.startswith(p):
+            logging.warning("Blocked scanner path: %s", request.url.path)
+            from starlette.responses import JSONResponse
+            return JSONResponse(status_code=404, content={"detail": "Not Found"})
+    for p in _BLOCKED_EXACT:
+        if path_lower == p or path_lower == p + "/":
+            logging.warning("Blocked scanner path: %s", request.url.path)
+            from starlette.responses import JSONResponse
+            return JSONResponse(status_code=404, content={"detail": "Not Found"})
+    if "wp-config" in path_lower or path_lower in ("/config.json", "/config.json/"):
+        logging.warning("Blocked scanner path: %s", request.url.path)
+        from starlette.responses import JSONResponse
+        return JSONResponse(status_code=404, content={"detail": "Not Found"})
+    return await call_next(request)
 
 
 class TelegramTestRequest(BaseModel):
@@ -156,66 +189,6 @@ def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
         why=why,
     )
 
-    raw_message = formatter.format_message(
-        symbol=symbol,
-        decision=decision,
-        entry=packet.proposed_entry,
-        sl=packet.sl,
-        tp1=packet.tp1,
-        tp2=packet.tp2,
-    )
-    message = raw_message
-    if settings.ai_enabled:
-        try:
-            coach_payload = {
-                "mode": "DECISION",
-                "decision": decision.model_dump(),
-                "packet": packet.model_dump(),
-                "news_state": packet.news_state,
-                "context_summary": packet.context_summary,
-                "raw_message": raw_message,
-            }
-            prompt = build_prompt(coach_payload)
-            date = now_utc_str[:10]
-            if can_call_ai(date, prompt):
-                coach_output = build_coach_output(coach_payload)
-                if coach_output.telegram_text:
-                    message = coach_output.telegram_text
-                ai_model = coach_output.model
-                ai_input_tokens += coach_output.input_tokens
-                ai_output_tokens += coach_output.output_tokens
-                ai_cost_usd += coach_output.cost_usd
-                ai_latency_ms = coach_output.latency_ms
-                ai_output = {
-                    "telegram_text": coach_output.telegram_text,
-                    "coach_bullets": coach_output.coach_bullets,
-                    "risk_note": coach_output.risk_note,
-                }
-                add_ai_usage(
-                    date,
-                    coach_output.input_tokens,
-                    coach_output.output_tokens,
-                    coach_output.cost_usd,
-                    coach_output.cost_eur,
-                )
-                insert_ai_message(
-                    now_utc_str,
-                    symbol,
-                    decision.status.value,
-                    coach_output.telegram_text,
-                    to_json(
-                        {
-                            "mode": "DECISION",
-                            "news_state": packet.news_state,
-                            "context_summary": packet.context_summary,
-                            "model": coach_output.model,
-                        }
-                    ),
-                )
-        except Exception:  # noqa: BLE001
-            message = raw_message
-
-    now_utc_str = packet.timestamps["ts_utc"]
     telegram_sent = 0
     telegram_error = None
     telegram_latency_ms = None
@@ -240,6 +213,75 @@ def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
         should_send = False
     if should_send and was_telegram_sent(signal_key):
         should_send = False
+
+    raw_message = formatter.format_message(
+        symbol=symbol,
+        decision=decision,
+        entry=packet.proposed_entry,
+        sl=packet.sl,
+        tp1=packet.tp1,
+        tp2=packet.tp2,
+        direction=packet.direction,
+    )
+    now_utc_str = packet.timestamps["ts_utc"]
+    mt5_ts = packet.timestamps.get("ts_paris") or now_utc_str
+    message = raw_message
+    if settings.ai_enabled and should_send:
+        try:
+            coach_payload = {
+                "mode": "DECISION",
+                "decision": decision.model_dump(),
+                "packet": packet.model_dump(),
+                "news_state": packet.news_state,
+                "context_summary": packet.context_summary,
+                "raw_message": raw_message,
+            }
+            prompt = build_prompt(coach_payload)
+            date = now_utc_str[:10]
+            if can_call_ai(date, prompt):
+                coach_output = build_coach_output(coach_payload)
+                if coach_output.telegram_text:
+                    message = coach_output.telegram_text
+                    if status == DecisionStatus.go:
+                        title = formatter.format_go_title(symbol, packet.direction)
+                        lines = message.strip().split("\n")
+                        lines[0] = title
+                        message = "\n".join(lines)
+                ai_model = coach_output.model
+                ai_input_tokens += coach_output.input_tokens
+                ai_output_tokens += coach_output.output_tokens
+                ai_cost_usd += coach_output.cost_usd
+                ai_latency_ms = coach_output.latency_ms
+                ai_output = DecisionAIOutput(
+                    decision=decision.status,
+                    confidence=decision.confidence,
+                    quality=decision.quality,
+                    why=decision.why,
+                    notes=coach_output.risk_note or None,
+                )
+                add_ai_usage(
+                    date,
+                    coach_output.input_tokens,
+                    coach_output.output_tokens,
+                    coach_output.cost_usd,
+                    coach_output.cost_eur,
+                )
+                insert_ai_message(
+                    mt5_ts,
+                    symbol,
+                    decision.status.value,
+                    coach_output.telegram_text,
+                    to_json(
+                        {
+                            "mode": "DECISION",
+                            "news_state": packet.news_state,
+                            "context_summary": packet.context_summary,
+                            "model": coach_output.model,
+                        }
+                    ),
+                )
+        except Exception:  # noqa: BLE001
+            message = raw_message
 
     prealert_text = None
     alert_key = None
@@ -278,7 +320,7 @@ def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
                             coach_output.cost_eur,
                         )
                         insert_ai_message(
-                            now_utc_str,
+                            mt5_ts,
                             symbol,
                             "PRE_ALERT",
                             coach_output.telegram_text,
@@ -304,13 +346,13 @@ def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
 
     insert_signal(
         {
-            "ts_utc": now_utc_str,
+            "ts_utc": mt5_ts,
             "symbol": symbol,
             "tf_signal": settings.tf_signal,
             "tf_context": settings.tf_context,
             "status": decision.status.value,
             "blocked_by": decision.blocked_by.value if decision.blocked_by else None,
-            "direction": "BUY",
+            "direction": packet.direction,
             "entry": packet.proposed_entry,
             "sl": packet.sl,
             "tp1": packet.tp1,
@@ -339,7 +381,8 @@ def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
             "ai_latency_ms": ai_latency_ms,
         }
     )
-    update_on_decision(day_paris, signal_key, now_utc_str)
+    if status == DecisionStatus.go:
+        update_on_decision(day_paris, signal_key, now_utc_str)
 
     return AnalyzeResponse(
         decision=decision,
@@ -474,6 +517,7 @@ def coach_preview(
         sl=packet.sl,
         tp1=packet.tp1,
         tp2=packet.tp2,
+        direction=packet.direction,
     )
 
     message = raw_message
@@ -502,7 +546,7 @@ def coach_preview(
                     coach_output.cost_eur,
                 )
                 insert_ai_message(
-                    packet.timestamps["ts_utc"],
+                    packet.timestamps.get("ts_paris") or packet.timestamps["ts_utc"],
                     symbol,
                     decision.status.value,
                     coach_output.telegram_text,

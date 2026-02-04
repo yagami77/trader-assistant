@@ -49,6 +49,17 @@ def get_today_state(day_paris: str) -> StateRow:
     return _row_to_state(row)
 
 
+def reset_cooldown(day_paris: str) -> None:
+    """Réinitialise le cooldown pour le jour (efface last_signal_key et last_ts)."""
+    conn = get_conn()
+    conn.execute(
+        "UPDATE state SET last_signal_key = NULL, last_ts = NULL WHERE day_paris = ?",
+        (day_paris,),
+    )
+    conn.commit()
+    conn.close()
+
+
 def update_on_decision(day_paris: str, signal_key: str, ts_utc: str) -> None:
     conn = get_conn()
     conn.execute(
