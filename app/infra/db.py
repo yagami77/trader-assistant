@@ -57,47 +57,6 @@ def init_db() -> None:
         """
     )
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(signals)").fetchall()}
-    if "ts_local" in columns:
-        conn.execute("DROP TABLE signals")
-        conn.execute(
-            """
-            CREATE TABLE signals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts_utc TEXT NOT NULL,
-                symbol TEXT NOT NULL,
-                tf_signal TEXT NOT NULL,
-                tf_context TEXT NOT NULL,
-                status TEXT NOT NULL,
-                blocked_by TEXT,
-                direction TEXT,
-                entry REAL,
-                sl REAL,
-                tp1 REAL,
-                tp2 REAL,
-                rr_tp2 REAL,
-                score_total INTEGER,
-                score_effective INTEGER,
-                telegram_sent INTEGER,
-                telegram_error TEXT,
-                telegram_latency_ms INTEGER,
-                alert_key TEXT,
-                score_rules_json TEXT,
-                ai_enabled INTEGER,
-                ai_output_json TEXT,
-                ai_model TEXT,
-                ai_input_tokens INTEGER,
-                ai_output_tokens INTEGER,
-                ai_cost_usd REAL,
-                decision_packet_json TEXT,
-                signal_key TEXT,
-                reasons_json TEXT,
-                message TEXT,
-                data_latency_ms INTEGER,
-                ai_latency_ms INTEGER
-            )
-            """
-        )
-        columns = {row["name"] for row in conn.execute("PRAGMA table_info(signals)").fetchall()}
     if "score_effective" not in columns:
         conn.execute("ALTER TABLE signals ADD COLUMN score_effective INTEGER")
     if "telegram_sent" not in columns:
@@ -125,6 +84,33 @@ def init_db() -> None:
             last_signal_key TEXT,
             last_ts TEXT,
             consecutive_losses INTEGER
+        );
+        """
+    )
+    state_cols = {r["name"] for r in conn.execute("PRAGMA table_info(state)").fetchall()}
+    for col, typ in [
+        ("last_setup_direction", "TEXT"),
+        ("last_setup_entry", "REAL"),
+        ("last_setup_bar_ts", "TEXT"),
+        ("setup_confirm_count", "INTEGER"),
+        ("active_entry", "REAL"),
+        ("active_sl", "REAL"),
+        ("active_tp1", "REAL"),
+        ("active_tp2", "REAL"),
+        ("active_direction", "TEXT"),
+        ("last_suivi_alerte_ts", "TEXT"),
+        ("last_suivi_maintien_sent", "INTEGER"),
+        ("active_started_ts", "TEXT"),
+        ("last_suivi_situation_ts", "TEXT"),
+        ("last_trade_closed_ts", "TEXT"),
+    ]:
+        if col not in state_cols:
+            conn.execute(f"ALTER TABLE state ADD COLUMN {col} {typ}")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS meta (
+            key TEXT PRIMARY KEY,
+            value TEXT
         );
         """
     )
@@ -156,40 +142,21 @@ def init_db() -> None:
         """
         CREATE TABLE IF NOT EXISTS signal_outcomes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            signal_id INTEGER UNIQUE,
-            ts_checked_utc TEXT,
-            outcome_status TEXT,
-            outcome_reason TEXT,
-            hit_tp1 INTEGER,
-            hit_tp2 INTEGER,
-            hit_sl INTEGER,
-            max_favorable_points REAL,
-            max_adverse_points REAL,
-            pnl_points REAL,
-            horizon_minutes INTEGER,
-            price_path_start_ts INTEGER,
-            price_path_end_ts INTEGER
+            signal_id INTEGER,
+            ts_utc TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            direction TEXT,
+            entry REAL,
+            sl REAL,
+            tp1 REAL,
+            tp2 REAL,
+            outcome TEXT,
+            pnl_pts REAL,
+            outcome_ts_utc TEXT,
+            FOREIGN KEY (signal_id) REFERENCES signals(id)
         );
         """
     )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_signal_outcomes_signal_id ON signal_outcomes(signal_id)"
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_signal_outcomes_ts_checked ON signal_outcomes(ts_checked_utc)"
-    )
-    conn.commit()
-    conn.close()
-
-
-def truncate_all_tables() -> None:
-    """Vide toutes les tables (nouveau suivi propre)."""
-    conn = get_conn()
-    for table in ("signals", "signal_outcomes", "state", "ai_usage_daily", "ai_messages"):
-        try:
-            conn.execute(f"DELETE FROM {table}")
-        except sqlite3.OperationalError:
-            pass  # table may not exist
     conn.commit()
     conn.close()
 
@@ -234,6 +201,55 @@ def was_telegram_sent(signal_key: str) -> bool:
     ).fetchone()
     conn.close()
     return row is not None
+
+
+def get_last_analyze_ts() -> Optional[str]:
+    """Dernier ts_utc d'une analyse (pour /runner/status)."""
+    try:
+        conn = get_conn()
+        row = conn.execute(
+            "SELECT ts_utc FROM signals ORDER BY ts_utc DESC LIMIT 1",
+            (),
+        ).fetchone()
+        conn.close()
+        return row["ts_utc"] if row else None
+    except Exception:
+        return None
+
+
+def get_last_telegram_sent_ts() -> Optional[str]:
+    """Dernier ts_utc d'un signal envoyé sur Telegram (pour heartbeat)."""
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT ts_utc FROM signals WHERE telegram_sent = 1 ORDER BY ts_utc DESC LIMIT 1",
+        (),
+    ).fetchone()
+    conn.close()
+    return row["ts_utc"] if row else None
+
+
+def get_last_go_sent_today(day_paris: str) -> Optional[dict]:
+    """Dernier GO envoyé à Telegram aujourd'hui (entry, sl, tp1, tp2, ts_utc) pour éviter doublons."""
+    conn = get_conn()
+    row = conn.execute(
+        """
+        SELECT entry, sl, tp1, tp2, ts_utc
+        FROM signals
+        WHERE status = 'go' AND telegram_sent = 1 AND ts_utc LIKE ?
+        ORDER BY ts_utc DESC LIMIT 1
+        """,
+        (f"{day_paris}%",),
+    ).fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {
+        "entry": float(row["entry"]) if row["entry"] is not None else None,
+        "sl": float(row["sl"]) if row["sl"] is not None else None,
+        "tp1": float(row["tp1"]) if row["tp1"] is not None else None,
+        "tp2": float(row["tp2"]) if row["tp2"] is not None else None,
+        "ts_utc": row["ts_utc"],
+    }
 
 
 def was_alert_sent(alert_key: str) -> bool:
@@ -286,6 +302,409 @@ def add_ai_usage(date: str, tokens_in: int, tokens_out: int, cost_usd: float, co
     conn.close()
 
 
+def get_last_go_signal(symbol: str) -> Optional[dict]:
+    """Dernier GO envoyé (telegram_sent=1) pour le suivi."""
+    try:
+        conn = get_conn()
+        row = conn.execute(
+            """
+            SELECT ts_utc, direction, entry, sl, tp1, tp2
+            FROM signals
+            WHERE symbol = ? AND status = 'GO' AND telegram_sent = 1
+            ORDER BY ts_utc DESC LIMIT 1
+            """,
+            (symbol,),
+        ).fetchone()
+        conn.close()
+        return dict(row) if row else None
+    except Exception:
+        return None
+
+
+def _get_active_trade_for_day(conn, day_paris: str) -> Optional[dict]:
+    """Trade actif pour un jour donné (interne)."""
+    row = conn.execute(
+        "SELECT active_entry, active_sl, active_tp1, active_tp2, active_direction, active_started_ts FROM state WHERE day_paris = ?",
+        (day_paris,),
+    ).fetchone()
+    if row and row["active_entry"] is not None:
+        return dict(row)
+    return None
+
+
+def get_active_trade(day_paris: str) -> Optional[dict]:
+    """Trade actif en cours (aujourd'hui ou hier si ouvert en fin de journée)."""
+    try:
+        conn = get_conn()
+        active = _get_active_trade_for_day(conn, day_paris)
+        if active is not None:
+            conn.close()
+            return active
+        # Trade pouvant être dans la ligne d'hier (ouvert en fin de session)
+        try:
+            from datetime import datetime, timedelta
+            dt = datetime.strptime(day_paris, "%Y-%m-%d")
+            yesterday = (dt - timedelta(days=1)).strftime("%Y-%m-%d")
+            active = _get_active_trade_for_day(conn, yesterday)
+        except (ValueError, TypeError):
+            pass
+        conn.close()
+        return active
+    except Exception:
+        return None
+
+
+def set_active_trade(
+    day_paris: str,
+    entry: float,
+    sl: float,
+    tp1: float,
+    tp2: float,
+    direction: str,
+    started_ts: Optional[str] = None,
+) -> None:
+    conn = get_conn()
+    conn.execute(
+        """
+        UPDATE state SET active_entry=?, active_sl=?, active_tp1=?, active_tp2=?, active_direction=?,
+            last_suivi_alerte_ts=NULL, last_suivi_maintien_sent=0, active_started_ts=?, last_suivi_situation_ts=NULL
+        WHERE day_paris=?
+        """,
+        (entry, sl, tp1, tp2, direction, started_ts, day_paris),
+    )
+    conn.commit()
+    conn.close()
+
+
+def clear_all_active_trades() -> int:
+    """Efface le trade actif pour TOUS les jours. Retourne le nb de rows modifiées."""
+    conn = get_conn()
+    cur = conn.execute(
+        "UPDATE state SET active_entry=NULL, active_sl=NULL, active_tp1=NULL, active_tp2=NULL, "
+        "active_direction=NULL, last_suivi_alerte_ts=NULL, last_suivi_maintien_sent=0, active_started_ts=NULL, last_suivi_situation_ts=NULL, last_trade_closed_ts=NULL"
+    )
+    n = cur.rowcount if cur.rowcount >= 0 else 0
+    conn.commit()
+    conn.close()
+    return n
+
+
+def clear_active_trade(day_paris: str, closed_ts: Optional[str] = None) -> None:
+    """Efface le trade actif. Si closed_ts fourni (TP/SL touché), enregistre pour cooldown prochain GO.
+    Efface aujourd'hui ET hier pour ne jamais laisser un trade bloqué (ouvert en fin de journée)."""
+    conn = get_conn()
+    days_to_clear = [day_paris]
+    try:
+        from datetime import datetime, timedelta
+        dt = datetime.strptime(day_paris, "%Y-%m-%d")
+        yesterday = (dt - timedelta(days=1)).strftime("%Y-%m-%d")
+        days_to_clear.append(yesterday)
+    except (ValueError, TypeError):
+        pass
+    for i, d in enumerate(days_to_clear):
+        use_closed_ts = closed_ts and (i == 0)  # last_trade_closed_ts uniquement sur le jour courant
+        if use_closed_ts:
+            conn.execute(
+                "UPDATE state SET active_entry=NULL, active_sl=NULL, active_tp1=NULL, active_tp2=NULL, active_direction=NULL, "
+                "last_suivi_alerte_ts=NULL, last_suivi_maintien_sent=0, active_started_ts=NULL, last_suivi_situation_ts=NULL, last_trade_closed_ts=? WHERE day_paris=?",
+                (closed_ts, d),
+            )
+        else:
+            conn.execute(
+                "UPDATE state SET active_entry=NULL, active_sl=NULL, active_tp1=NULL, active_tp2=NULL, active_direction=NULL, "
+                "last_suivi_alerte_ts=NULL, last_suivi_maintien_sent=0, active_started_ts=NULL, last_suivi_situation_ts=NULL WHERE day_paris=?",
+                (d,),
+            )
+    conn.commit()
+    conn.close()
+    # Pour que le prochain trade puisse recevoir un SORTIE, on efface le marqueur "déjà envoyé"
+    clear_suivi_sortie_sent(day_paris)
+
+
+def get_last_trade_closed_ts(day_paris: str) -> Optional[str]:
+    """Dernier moment où un trade a été clôturé (TP/SL) pour appliquer le cooldown avant nouveau GO."""
+    try:
+        conn = get_conn()
+        row = conn.execute(
+            "SELECT last_trade_closed_ts FROM state WHERE day_paris = ?",
+            (day_paris,),
+        ).fetchone()
+        conn.close()
+        return row["last_trade_closed_ts"] if row and row["last_trade_closed_ts"] else None
+    except Exception:
+        return None
+
+
+def get_last_suivi_alerte_ts(day_paris: str) -> Optional[str]:
+    """Dernier timestamp d'envoi d'une ALERTE suivi (pour relance après N min)."""
+    try:
+        conn = get_conn()
+        row = conn.execute(
+            "SELECT last_suivi_alerte_ts FROM state WHERE day_paris = ?",
+            (day_paris,),
+        ).fetchone()
+        conn.close()
+        return row["last_suivi_alerte_ts"] if row and row["last_suivi_alerte_ts"] else None
+    except Exception:
+        return None
+
+
+def was_suivi_maintien_sent(day_paris: str) -> bool:
+    """MAINTIEN déjà envoyé pour le trade actif ?"""
+    try:
+        conn = get_conn()
+        row = conn.execute(
+            "SELECT last_suivi_maintien_sent FROM state WHERE day_paris = ?",
+            (day_paris,),
+        ).fetchone()
+        conn.close()
+        return bool(row and row["last_suivi_maintien_sent"])
+    except Exception:
+        return False
+
+
+def set_suivi_maintien_sent(day_paris: str) -> None:
+    """Marque MAINTIEN comme envoyé."""
+    conn = get_conn()
+    conn.execute("UPDATE state SET last_suivi_maintien_sent=1 WHERE day_paris=?", (day_paris,))
+    conn.commit()
+    conn.close()
+
+
+def set_last_suivi_alerte_ts(day_paris: str, ts_utc: str) -> None:
+    """Enregistre l'envoi d'une ALERTE suivi."""
+    conn = get_conn()
+    conn.execute(
+        "UPDATE state SET last_suivi_alerte_ts=? WHERE day_paris=?",
+        (ts_utc, day_paris),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_last_suivi_situation_ts(day_paris: str) -> Optional[str]:
+    """Dernier envoi d'un message « situation » suivi (pour espacement 15 min)."""
+    try:
+        conn = get_conn()
+        row = conn.execute(
+            "SELECT last_suivi_situation_ts FROM state WHERE day_paris = ?",
+            (day_paris,),
+        ).fetchone()
+        conn.close()
+        return row["last_suivi_situation_ts"] if row and row["last_suivi_situation_ts"] else None
+    except Exception:
+        return None
+
+
+def set_last_suivi_situation_ts(day_paris: str, ts_utc: str) -> None:
+    """Enregistre l'envoi d'un message situation suivi."""
+    conn = get_conn()
+    conn.execute(
+        "UPDATE state SET last_suivi_situation_ts=? WHERE day_paris=?",
+        (ts_utc, day_paris),
+    )
+    conn.commit()
+    conn.close()
+
+
+def record_trade_outcome(day_paris: str, pnl_pips: float) -> None:
+    """Enregistre le résultat d'un trade clôturé (pips, signés) pour le résumé du jour."""
+    key = f"trade_outcomes_{day_paris}"
+    try:
+        conn = get_conn()
+        row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        current = json.loads(row["value"]) if row and row["value"] else []
+        current.append(round(pnl_pips, 1))
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+            (key, json.dumps(current)),
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+
+def get_trade_outcomes_today(day_paris: str) -> list:
+    """Liste des résultats (pips signés) des trades clôturés aujourd'hui."""
+    key = f"trade_outcomes_{day_paris}"
+    try:
+        conn = get_conn()
+        row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        conn.close()
+        if row and row["value"]:
+            return json.loads(row["value"])
+    except Exception:
+        pass
+    return []
+
+
+def get_stats_summary(day_paris: str) -> Dict[str, Any]:
+    """Résumé du jour : GO/NO_GO, outcomes, budget (pour GET /stats/summary)."""
+    prefix = f"{day_paris}"
+    try:
+        conn = get_conn()
+        go_row = conn.execute(
+            "SELECT COUNT(*) as n FROM signals WHERE ts_utc LIKE ? AND status = 'go'",
+            (f"{prefix}%",),
+        ).fetchone()
+        no_go_row = conn.execute(
+            "SELECT COUNT(*) as n FROM signals WHERE ts_utc LIKE ? AND status = 'no_go'",
+            (f"{prefix}%",),
+        ).fetchone()
+        last_row = conn.execute(
+            "SELECT ts_utc FROM signals WHERE ts_utc LIKE ? ORDER BY ts_utc DESC LIMIT 1",
+            (f"{prefix}%",),
+        ).fetchone()
+        state_row = conn.execute(
+            "SELECT daily_loss_amount, daily_budget_amount FROM state WHERE day_paris = ?",
+            (day_paris,),
+        ).fetchone()
+        conn.close()
+        n_go = int(go_row["n"]) if go_row else 0
+        n_no_go = int(no_go_row["n"]) if no_go_row else 0
+        outcomes = get_trade_outcomes_today(day_paris)
+        total_pips = round(sum(outcomes), 1) if outcomes else 0.0
+        daily_loss = float(state_row["daily_loss_amount"]) if state_row and state_row["daily_loss_amount"] is not None else 0.0
+        daily_budget = float(state_row["daily_budget_amount"]) if state_row and state_row["daily_budget_amount"] is not None else 20.0
+        return {
+            "day_paris": day_paris,
+            "n_go": n_go,
+            "n_no_go": n_no_go,
+            "n_analyzes": n_go + n_no_go,
+            "outcomes_pips": outcomes,
+            "total_pips": total_pips,
+            "daily_loss_amount": daily_loss,
+            "daily_budget_amount": daily_budget,
+            "last_signal_ts": last_row["ts_utc"] if last_row else None,
+        }
+    except Exception:
+        return {
+            "day_paris": day_paris,
+            "n_go": 0,
+            "n_no_go": 0,
+            "n_analyzes": 0,
+            "outcomes_pips": [],
+            "total_pips": 0.0,
+            "daily_loss_amount": 0.0,
+            "daily_budget_amount": 20.0,
+            "last_signal_ts": None,
+        }
+
+
+def get_last_suivi_sortie_active_started_ts(day_paris: str) -> Optional[str]:
+    """active_started_ts du trade pour lequel on a déjà envoyé un message SORTIE (Bravo TP1/SL/TP2). Évite doublon."""
+    key = f"suivi_sortie_sent_{day_paris}"
+    try:
+        conn = get_conn()
+        row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        conn.close()
+        return (row["value"] or "").strip() or None if row and row["value"] else None
+    except Exception:
+        return None
+
+
+def set_last_suivi_sortie_sent(day_paris: str, active_started_ts: Optional[str]) -> None:
+    """Marque qu'on a envoyé le message SORTIE pour ce trade (active_started_ts)."""
+    key = f"suivi_sortie_sent_{day_paris}"
+    conn = get_conn()
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+        (key, active_started_ts or ""),
+    )
+    conn.commit()
+    conn.close()
+
+
+def clear_suivi_sortie_sent(day_paris: str) -> None:
+    """Efface le marqueur SORTIE envoyé (après clear_active_trade pour le jour)."""
+    key = f"suivi_sortie_sent_{day_paris}"
+    try:
+        conn = get_conn()
+        conn.execute("DELETE FROM meta WHERE key = ?", (key,))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+
+def was_daily_summary_sent(day_paris: str) -> bool:
+    """Résumé du jour déjà envoyé pour cette date ?"""
+    key = f"daily_summary_sent_{day_paris}"
+    try:
+        conn = get_conn()
+        row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        conn.close()
+        return bool(row and row["value"] == "1")
+    except Exception:
+        return False
+
+
+def set_daily_summary_sent(day_paris: str) -> None:
+    """Marque le résumé du jour comme envoyé."""
+    key = f"daily_summary_sent_{day_paris}"
+    conn = get_conn()
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+        (key, "1"),
+    )
+    conn.commit()
+    conn.close()
+
+
+def was_data_off_alert_sent_today(day_paris: str) -> bool:
+    """True si une alerte DATA_OFF a été envoyée aujourd'hui (pour envoyer "données de retour" une fois)."""
+    key = f"data_off_alert_sent_{day_paris}"
+    try:
+        conn = get_conn()
+        row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        conn.close()
+        return bool(row and row["value"] == "1")
+    except Exception:
+        return False
+
+
+def set_data_off_alert_sent(day_paris: str) -> None:
+    """Marque qu'une alerte DATA_OFF a été envoyée aujourd'hui."""
+    key = f"data_off_alert_sent_{day_paris}"
+    conn = get_conn()
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+        (key, "1"),
+    )
+    conn.commit()
+    conn.close()
+
+
+def clear_data_off_alert_sent(day_paris: str) -> None:
+    """Réinitialise après envoi du message « données de retour »."""
+    key = f"data_off_alert_sent_{day_paris}"
+    conn = get_conn()
+    conn.execute("DELETE FROM meta WHERE key = ?", (key,))
+    conn.commit()
+    conn.close()
+
+
+def get_recent_signals(symbol: str, limit: int = 20) -> list:
+    """Derniers signaux pour contexte historique (niveaux testés, GO/NO_GO)."""
+    try:
+        conn = get_conn()
+        rows = conn.execute(
+            """
+            SELECT ts_utc, status, blocked_by, direction, entry, sl, tp1, score_total
+            FROM signals
+            WHERE symbol = ?
+            ORDER BY ts_utc DESC
+            LIMIT ?
+            """,
+            (symbol, limit),
+        ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception:
+        return []
+
+
 def insert_ai_message(ts_utc: str, symbol: str, decision: str, text: str, meta_json: Optional[str]) -> None:
     conn = get_conn()
     conn.execute(
@@ -294,41 +713,6 @@ def insert_ai_message(ts_utc: str, symbol: str, decision: str, text: str, meta_j
         VALUES (?, ?, ?, ?, ?)
         """,
         (ts_utc, symbol, decision, text, meta_json),
-    )
-    conn.commit()
-    conn.close()
-
-
-def upsert_signal_outcome(payload: Dict[str, Any]) -> None:
-    conn = get_conn()
-    conn.execute(
-        """
-        INSERT INTO signal_outcomes (
-            signal_id, ts_checked_utc, outcome_status, outcome_reason,
-            hit_tp1, hit_tp2, hit_sl,
-            max_favorable_points, max_adverse_points, pnl_points,
-            horizon_minutes, price_path_start_ts, price_path_end_ts
-        ) VALUES (
-            :signal_id, :ts_checked_utc, :outcome_status, :outcome_reason,
-            :hit_tp1, :hit_tp2, :hit_sl,
-            :max_favorable_points, :max_adverse_points, :pnl_points,
-            :horizon_minutes, :price_path_start_ts, :price_path_end_ts
-        )
-        ON CONFLICT(signal_id) DO UPDATE SET
-            ts_checked_utc=excluded.ts_checked_utc,
-            outcome_status=excluded.outcome_status,
-            outcome_reason=excluded.outcome_reason,
-            hit_tp1=excluded.hit_tp1,
-            hit_tp2=excluded.hit_tp2,
-            hit_sl=excluded.hit_sl,
-            max_favorable_points=excluded.max_favorable_points,
-            max_adverse_points=excluded.max_adverse_points,
-            pnl_points=excluded.pnl_points,
-            horizon_minutes=excluded.horizon_minutes,
-            price_path_start_ts=excluded.price_path_start_ts,
-            price_path_end_ts=excluded.price_path_end_ts
-        """,
-        payload,
     )
     conn.commit()
     conn.close()

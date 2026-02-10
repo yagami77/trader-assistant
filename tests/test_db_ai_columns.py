@@ -22,6 +22,7 @@ def test_ai_columns_insert(tmp_path):
             "sl": 1.0,
             "tp1": 1.0,
             "tp2": 1.0,
+            "rr_tp1": 1.5,
             "rr_tp2": 2.0,
             "score_total": 90,
             "score_effective": 90,

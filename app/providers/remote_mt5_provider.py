@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 
 import httpx
 
@@ -56,3 +56,14 @@ class RemoteMT5Provider:
         if ts:
             return datetime.fromisoformat(ts)
         return datetime.now(timezone.utc)
+
+    def get_tick(self, symbol: str) -> Optional[Tuple[float, float]]:
+        try:
+            payload = self._request("/tick", {"symbol": symbol})
+            bid = payload.get("bid")
+            ask = payload.get("ask")
+            if bid is not None and ask is not None:
+                return (float(bid), float(ask))
+        except Exception:
+            pass
+        return None

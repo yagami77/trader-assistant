@@ -67,12 +67,8 @@ def _enrich_telegram_text(text: str, payload: Dict[str, Any]) -> str:
     decision = payload.get("decision", {})
     packet = payload.get("packet", {})
     status = str(decision.get("status", "")).upper()
+    lower = text.lower()
     lines: List[str] = [text.strip()] if text else []
-    penalties = packet.get("penalties") or {}
-    spread_penalty = penalties.get("spread_penalty") or 0
-    spread_points = penalties.get("spread_points")
-    spread_ratio = penalties.get("spread_ratio")
-    blocked_by = str(decision.get("blocked_by", "")).upper()
 
     if status == "GO" and "🎯 plan" not in text:
         lines.extend(
@@ -87,14 +83,16 @@ def _enrich_telegram_text(text: str, payload: Dict[str, Any]) -> str:
             ]
         )
 
-    # Spread info for coach
-    if blocked_by == "SPREAD_TOO_HIGH" and spread_points is not None:
-        ratio_txt = f" (~{spread_ratio:.2%} du SL)" if spread_ratio is not None else ""
-        lines.append(f"⛔ Spread trop élevé: {spread_points:.1f} pts{ratio_txt}")
-    elif spread_penalty and spread_points is not None:
-        ratio_txt = f" (~{spread_ratio:.2%} du SL)" if spread_ratio is not None else ""
-        lines.append(
-            f"⚠️ Spread élevé: {spread_points:.1f} pts{ratio_txt} → -{int(spread_penalty)} pts"
+    if "explications simples" not in lower:
+        lines.extend(
+            [
+                "",
+                "🔍 Explications simples",
+                f"- RR TP1: {_format_value(packet.get('rr_tp1'))}, TP2: {_format_value(packet.get('rr_tp2'))} (plus haut = mieux)",
+                f"- Spread: {_format_value(packet.get('spread'))} (coût d'entrée), max {_format_value(packet.get('spread_max'))}",
+                f"- Volatilité (ATR): {_format_value(packet.get('atr'))}, max {_format_value(packet.get('atr_max'))}",
+                f"- Bias H1: {_format_value(packet.get('bias_h1'))} (direction dominante)",
+            ]
         )
 
     return "\n".join(lines).strip()

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Dict, List, Protocol
+from typing import Dict, List, Optional, Protocol, Tuple
 
 
 class MarketDataProvider(Protocol):
@@ -15,4 +15,8 @@ class MarketDataProvider(Protocol):
         ...
 
     def get_server_time(self) -> datetime:
+        ...
+
+    def get_tick(self, symbol: str) -> Optional[Tuple[float, float]]:
+        """(bid, ask) ou None si indisponible."""
         ...

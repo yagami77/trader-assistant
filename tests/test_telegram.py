@@ -25,11 +25,13 @@ def _make_client(tmp_path, extra_env=None):
         "TELEGRAM_SEND_NO_GO_IMPORTANT",
         "TELEGRAM_NO_GO_IMPORTANT_BLOCKS",
         "NEWS_CALENDAR_PATH",
+        "SETUP_CONFIRM_MIN_BARS",
     ]:
         os.environ.pop(key, None)
     if extra_env:
         for key, value in extra_env.items():
             os.environ[key] = value
+    os.environ.setdefault("SETUP_CONFIRM_MIN_BARS", "1")
     from app.config import get_settings
     from app.infra.db import init_db
     from app.api.main import app
@@ -54,6 +56,7 @@ def test_telegram_go_sends(monkeypatch, tmp_path):
             "TELEGRAM_ENABLED": "true",
             "TELEGRAM_BOT_TOKEN": "test",
             "TELEGRAM_CHAT_ID": "123",
+            "RR_MIN": "0.01",
         },
     )
     resp = client.post("/analyze", json={"symbol": "XAUUSD"})
@@ -145,6 +148,7 @@ def test_telegram_duplicate_not_sent(monkeypatch, tmp_path):
             "TELEGRAM_ENABLED": "true",
             "TELEGRAM_BOT_TOKEN": "test",
             "TELEGRAM_CHAT_ID": "123",
+            "RR_MIN": "0.01",
         },
     )
     first = client.post("/analyze", json={"symbol": "XAUUSD"})

@@ -16,16 +16,36 @@ class Settings(BaseModel):
     tf_signal: str = Field(default="M15", validation_alias="TF_SIGNAL")
     tf_context: str = Field(default="H1", validation_alias="TF_CONTEXT")
     spread_max: float = Field(default=20.0, validation_alias="SPREAD_MAX")
-    hard_spread_max_points: float = Field(default=40.0, validation_alias="HARD_SPREAD_MAX_POINTS")
-    soft_spread_start_points: float = Field(default=20.0, validation_alias="SOFT_SPREAD_START_POINTS")
-    soft_spread_max_penalty: int = Field(default=30, validation_alias="SOFT_SPREAD_MAX_PENALTY")
-    hard_spread_max_ratio: float = Field(default=0.12, validation_alias="HARD_SPREAD_MAX_RATIO")
-    soft_spread_start_ratio: float = Field(default=0.06, validation_alias="SOFT_SPREAD_START_RATIO")
+    hard_spread_max_pts: float = Field(default=30.0, validation_alias="HARD_SPREAD_MAX_PTS")
+    soft_spread_start_pts: float = Field(default=18.0, validation_alias="SOFT_SPREAD_START_PTS")
+    hard_spread_max_ratio: float = Field(default=0.15, validation_alias="HARD_SPREAD_MAX_RATIO")
     atr_max: float = Field(default=2.0, validation_alias="ATR_MAX")
-    sl_max_atr_multiple: float = Field(default=1.5, validation_alias="SL_MAX_ATR_MULTIPLE")
-    sl_max_points: float = Field(default=25.0, validation_alias="SL_MAX_POINTS")
-    rr_min: float = Field(default=2.0, validation_alias="RR_MIN")
+    rr_min: float = Field(default=1.5, validation_alias="RR_MIN")
+    rr_min_tp1: float = Field(default=0.4, validation_alias="RR_MIN_TP1")
+    rr_hard_min_tp1: float = Field(default=0.2, validation_alias="RR_HARD_MIN_TP1")
+    sl_min_pts: float = Field(default=20.0, validation_alias="SL_MIN_PTS")
+    sl_max_pts: float = Field(default=25.0, validation_alias="SL_MAX_PTS")
+    tp1_min_pts: float = Field(default=10.0, validation_alias="TP1_MIN_PTS")
+    tp1_max_pts: float = Field(default=100.0, validation_alias="TP1_MAX_PTS")
+    tp2_enable_bonus: bool = Field(default=True, validation_alias="TP2_ENABLE_BONUS")
+    tp2_max_bonus_pts: float = Field(default=60.0, validation_alias="TP2_MAX_BONUS_POINTS")
+    mode_trading: str = Field(default="scalp", validation_alias="MODE_TRADING")
     cooldown_minutes: int = Field(default=20, validation_alias="COOLDOWN_MINUTES")
+    suivi_alerte_interval_minutes: int = Field(
+        default=2, validation_alias="SUIVI_ALERTE_INTERVAL_MINUTES"
+    )
+    suivi_situation_interval_minutes: int = Field(
+        default=5, validation_alias="SUIVI_SITUATION_INTERVAL_MINUTES"
+    )
+    cooldown_after_trade_minutes: int = Field(
+        default=5, validation_alias="COOLDOWN_AFTER_TRADE_MINUTES"
+    )
+    no_go_important_cooldown_minutes: int = Field(
+        default=3, validation_alias="NO_GO_IMPORTANT_COOLDOWN_MINUTES"
+    )
+    daily_summary_hour_paris: int = Field(
+        default=22, validation_alias="DAILY_SUMMARY_HOUR_PARIS"
+    )
     daily_budget_amount: float = Field(default=20.0, validation_alias="DAILY_BUDGET_AMOUNT")
     news_calendar_path: str = Field(
         default="data/news_calendar_mock.json", validation_alias="NEWS_CALENDAR_PATH"
@@ -62,7 +82,9 @@ class Settings(BaseModel):
     context_api_base_url: str = Field(default="", validation_alias="CONTEXT_API_BASE_URL")
     context_api_key: str = Field(default="", validation_alias="CONTEXT_API_KEY")
     mt5_bridge_url: str = Field(default="", validation_alias="MT5_BRIDGE_URL")
-    data_max_age_sec: int = Field(default=120, validation_alias="DATA_MAX_AGE_SEC")
+    # DATA_MAX_AGE_SEC: âge max (sec) de la dernière bougie pour considérer les données OK. M15 = bougie 15 min → min 900.
+    # Ne pas mettre < 900 avec TF_SIGNAL=M15 sinon DATA_OFF systématique (cf. decision_packet data_latency = bougie la plus récente).
+    data_max_age_sec: int = Field(default=960, validation_alias="DATA_MAX_AGE_SEC")
     trading_session_mode: str = Field(default="windows", validation_alias="TRADING_SESSION_MODE")
     market_close_start: str = Field(default="23:55", validation_alias="MARKET_CLOSE_START")
     market_close_end: str = Field(default="00:05", validation_alias="MARKET_CLOSE_END")
@@ -88,18 +110,16 @@ class Settings(BaseModel):
     coach_mode: str = Field(default="pro", validation_alias="COACH_MODE")
     fx_eurusd: float = Field(default=1.08, validation_alias="FX_EURUSD")
 
-    # Outcome agent
-    outcome_agent_enabled: bool = Field(default=False, validation_alias="OUTCOME_AGENT_ENABLED")
-    outcome_agent_interval_sec: int = Field(default=300, validation_alias="OUTCOME_AGENT_INTERVAL_SEC")
-    outcome_agent_lookback_hours: int = Field(default=24, validation_alias="OUTCOME_AGENT_LOOKBACK_HOURS")
-    outcome_agent_wait_minutes: int = Field(default=10, validation_alias="OUTCOME_AGENT_WAIT_MINUTES")
-    outcome_agent_min_age_hours: int = Field(default=24, validation_alias="OUTCOME_AGENT_MIN_AGE_HOURS")
-    outcome_agent_run_only_during_market_close: bool = Field(
-        default=True, validation_alias="OUTCOME_AGENT_RUN_ONLY_DURING_MARKET_CLOSE"
-    )
-    outcome_agent_horizon_minutes: int = Field(default=180, validation_alias="OUTCOME_AGENT_HORIZON_MINUTES")
-    outcome_agent_candle_tf: str = Field(default="M1", validation_alias="OUTCOME_AGENT_CANDLE_TF")
-    outcome_agent_max_per_loop: int = Field(default=20, validation_alias="OUTCOME_AGENT_MAX_PER_LOOP")
+    # Seuils de score (GO si >= go_min_score, A+ si >= a_plus_min_score)
+    go_min_score: int = Field(default=80, validation_alias="GO_MIN_SCORE")
+    a_plus_min_score: int = Field(default=90, validation_alias="A_PLUS_MIN_SCORE")
+
+    # Approche incrémentale — confirmer le setup sur plusieurs barres
+    setup_confirm_min_bars: int = Field(default=2, validation_alias="SETUP_CONFIRM_MIN_BARS")
+    setup_entry_tolerance_pts: float = Field(default=50.0, validation_alias="SETUP_ENTRY_TOLERANCE_PTS")
+
+    # Suivi — distance min entre prix et S/R pour MAINTIEN (pts)
+    sr_buffer_points: float = Field(default=25.0, validation_alias="SR_BUFFER_POINTS")
 
     def model_post_init(self, __context: Optional[dict]) -> None:  # type: ignore[override]
         self.data_provider = str(self.data_provider).lower()
@@ -107,6 +127,9 @@ class Settings(BaseModel):
         self.log_level = str(self.log_level).upper()
         self.news_provider = str(self.news_provider).lower()
         self.trading_session_mode = str(self.trading_session_mode).lower()
+        # Éviter DATA_OFF permanent : avec M15 la bougie la plus récente a 0–15 min. Forcer un minimum.
+        if self.tf_signal.upper() == "M15" and self.data_max_age_sec < 900:
+            self.data_max_age_sec = 900
 
 
 @lru_cache

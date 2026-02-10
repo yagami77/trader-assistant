@@ -18,13 +18,14 @@ class BlockedBy(str, Enum):
     volatility_too_high = "VOLATILITY_TOO_HIGH"
     market_chop = "MARKET_CHOP"
     no_trend_bias = "NO_TREND_BIAS"
-    bias_h1_mismatch = "BIAS_H1_MISMATCH"
     no_setup = "NO_SETUP"
     rr_too_low = "RR_TOO_LOW"
+    sl_too_large = "SL_TOO_LARGE"
     duplicate_signal = "DUPLICATE_SIGNAL"
     daily_budget_reached = "DAILY_BUDGET_REACHED"
     data_off = "DATA_OFF"
     execution_guard = "EXECUTION_GUARD"
+    setup_not_confirmed = "SETUP_NOT_CONFIRMED"
 
 
 class Bias(str, Enum):
@@ -45,23 +46,20 @@ class DecisionPacket(BaseModel):
     news_next_event: Optional[Dict[str, str]] = None
     news_impact_summary: List[str] = []
     news_next_event_details: Optional[Dict[str, Any]] = None
-    news_state: Dict[str, Any] = Field(default_factory=dict)
+    news_state: Dict[str, Any] = {}
     spread: float
     spread_max: float
-    spread_ratio: Optional[float] = None
-    penalties: Dict[str, Any] = Field(default_factory=dict)
     atr: float
     atr_max: float
     bias_h1: Bias
-    direction: str
     setups_detected: List[str]
     proposed_entry: float
     sl: float
     tp1: float
     tp2: float
+    rr_tp1: float
     rr_tp2: float
     rr_min: float
-    tick_size: float = 0.0
     score_rules: int
     reasons_rules: List[str]
     sources_used: List[str]

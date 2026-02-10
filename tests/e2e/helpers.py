@@ -48,6 +48,7 @@ def run_api(env_overrides: Dict[str, str]) -> Generator[Tuple[str, Path], None, 
             "DATABASE_PATH": str(db_path),
             "LOG_LEVEL": "INFO",
             "MARKET_PROVIDER": "mock",
+            "SETUP_CONFIRM_MIN_BARS": "1",
         }
     )
     env.update(env_overrides)
@@ -111,12 +112,11 @@ def set_state_budget_reached(db_path: Path, day_paris: str) -> None:
     conn = sqlite3.connect(db_path)
     conn.execute(
         """
-        INSERT OR REPLACE INTO state (
-            day_paris, daily_loss_amount, daily_budget_amount,
-            last_signal_key, last_ts, consecutive_losses
-        ) VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO state (day_paris, daily_loss_amount, daily_budget_amount, consecutive_losses)
+        VALUES (?, 100, 20, 0)
+        ON CONFLICT(day_paris) DO UPDATE SET daily_loss_amount = 100, daily_budget_amount = 20
         """,
-        (day_paris, 100.0, 20.0, None, None, 0),
+        (day_paris,),
     )
     conn.commit()
     conn.close()

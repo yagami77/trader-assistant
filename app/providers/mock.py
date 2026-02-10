@@ -42,3 +42,7 @@ class MockDataProvider:
         if forced:
             return datetime.fromisoformat(forced)
         return datetime.now(timezone.utc)
+
+    def get_tick(self, symbol: str):
+        self._maybe_fail()
+        return (4671.5, 4672.0)  # bid, ask

@@ -4,6 +4,22 @@
 - `docker compose up -d --build`
 - API: `http://localhost:8000/health`
 
+## Développement complet (chaîne de bout en bout)
+Pour faire tourner toute la chaîne (analyse → suivi → Telegram) :
+
+1. **MT5** (prod) : lancer le terminal MetaTrader 5 et te connecter au broker.
+2. **MT5 Bridge** : `python -m uvicorn services.mt5_bridge.main:app --host 0.0.0.0 --port 5005` (ou 8080 selon config).
+3. **API Core** : `uvicorn app.api.main:app --host 0.0.0.0 --port 8081` (ou via `docker compose`). Variables : `MARKET_PROVIDER=remote_mt5`, `MT5_BRIDGE_URL=http://127.0.0.1:5005`, `DATA_MAX_AGE_SEC=960`.
+4. **Runner** : appelle `/analyze` périodiquement. Ex. `python -m app.scripts.runner_loop --interval 60 --symbol XAUUSD`. Option `--once` pour un seul cycle (dev/test).
+
+**Endpoints utiles**
+- `GET /health` — API OK
+- `GET /data-status` — données marché (bridge, latence, DATA_OFF)
+- `GET /stats/summary` — résumé du jour (GO/NO_GO, outcomes en points, budget)
+- `POST /analyze` — une analyse (également appelé par le runner)
+
+**Seuils de score** (optionnel dans `.env.local`) : `GO_MIN_SCORE=80`, `A_PLUS_MIN_SCORE=90`. GO si score ≥ 80, qualité A+ si ≥ 90.
+
 ## Telegram (GO + NO_GO importants)
 ### Créer un bot
 1) Ouvrir Telegram et chercher **@BotFather**.
@@ -26,9 +42,25 @@
 6) Tester: 
    - `curl -X POST http://localhost:8000/telegram/test -H "X-Admin-Token: <ADMIN_TOKEN>" -H "Content-Type: application/json" -d '{"text":"Test Telegram ✅"}'`
 
+Telegram reste en **lecture seule** : le bot envoie les signaux et alertes, aucun input (commande, webhook) n'est lu depuis Telegram.
+
+### Clôture manuelle (pips + Telegram)
+Si tu fermes le trade à la main (ex. sur MT5), appelle l'API pour enregistrer le résultat et envoyer le message sur Telegram :
+- `curl -X POST http://localhost:8000/trade/manual-close -H "X-Admin-Token: <ADMIN_TOKEN>"`
+Le système calcule les pips au prix actuel, enregistre pour le résumé du jour, efface le trade actif et envoie le résultat sur Telegram.
+
 ### Secrets
 - **DEV**: utiliser `.env.local` (non versionné).
 - **PROD**: variables d’environnement via panel VPS ou secrets Docker.
+
+## MT5 Bridge (données réelles)
+Le bridge MT5 (`services/mt5_bridge`) se connecte à MetaTrader 5 pour récupérer les prix et bougies en temps réel.
+
+**Prérequis :** MetaTrader 5 installé et **terminal lancé** avant le bridge.
+
+**Variables (.env.local) :** `MARKET_PROVIDER=remote_mt5`, `MT5_BRIDGE_URL=http://127.0.0.1:8080`
+
+**Ordre démarrage :** MT5 terminal → mt5-bridge → trader-core → trader-runner. Installation NSSM : `.\scripts\install_mt5_bridge_nssm.ps1`
 
 ## News + Context (Sprint 2.8)
 ### News API (TradingEconomics)
@@ -105,110 +137,7 @@ Variables:
    - `MARKET_PROVIDER=remote_mt5`
    - `MT5_BRIDGE_URL=http://<VPS_IP>:5005`
 
-## Windows PROD (NSSM)
-
-Sur un VPS Windows, 3 services tournent H24 : **mt5-bridge** (8080), **trader-core** (8081), **trader-runner** (appelle /analyze toutes les 5 min).
-
-### Prérequis
-- NSSM installé dans `C:\tools\nssm\nssm.exe`
-- Repos : `C:\trader-assistant` (bridge), `C:\trader-assistant-core` (core)
-- `.env.local` dans le core (source unique de config)
-
-### Installation des 3 services
-```powershell
-# En Administrateur
-cd C:\trader-assistant-core\deploy\windows
-.\install_all_services.ps1
-```
-
-### Installation du runner uniquement (bridge + core déjà en place)
-```powershell
-.\install_runner_nssm.ps1
-```
-
-### Commandes de gestion
-```powershell
-# Statut
-C:\tools\nssm\nssm.exe status mt5-bridge
-C:\tools\nssm\nssm.exe status trader-core
-C:\tools\nssm\nssm.exe status trader-runner
-C:\tools\nssm\nssm.exe status TraderOutcomeAgent
-
-# Stop / Start / Restart
-C:\tools\nssm\nssm.exe stop trader-runner
-C:\tools\nssm\nssm.exe start trader-runner
-C:\tools\nssm\nssm.exe restart trader-core
-```
-
-### Logs
-| Service      | Fichier |
-|-------------|---------|
-| mt5-bridge  | `C:\trader-assistant\logs\bridge.log` |
-| trader-core | `C:\trader-assistant-core\logs\core.log` |
-| trader-runner | `C:\trader-assistant-core\logs\runner.log` |
-| TraderOutcomeAgent | `C:\trader-assistant-core\logs\outcome_agent.log` |
-
-### Vérifications
-```powershell
-curl http://127.0.0.1:8080/health
-curl http://127.0.0.1:8081/health
-curl http://127.0.0.1:8081/runner/status
-curl -H "X-Admin-Token: <ADMIN_TOKEN>" http://127.0.0.1:8081/outcomes/latest?limit=50
-```
-
-### Outcome Agent (post-analyse)
-Service Windows: **TraderOutcomeAgent**
-
-Script: `scripts/run_outcome_agent.py`
-
-NSSM:
-```powershell
-cd C:\trader-assistant-core\deploy\windows
-.\install_outcome_agent_nssm.ps1
-```
-
-Endpoints:
-- `GET /outcomes/latest?limit=50` (admin token)
-
-Env vars:
-```
-OUTCOME_AGENT_ENABLED=true
-OUTCOME_AGENT_INTERVAL_SEC=300
-OUTCOME_AGENT_LOOKBACK_HOURS=24
-OUTCOME_AGENT_WAIT_MINUTES=10
-OUTCOME_AGENT_HORIZON_MINUTES=180
-OUTCOME_AGENT_CANDLE_TF=M1
-OUTCOME_AGENT_MAX_PER_LOOP=20
-```
-
-### Mini guide de vérification
-1. Appeler `/analyze` :
-```
-curl -X POST http://127.0.0.1:8081/analyze -H "Content-Type: application/json" -d "{\"symbol\":\"XAUUSD\"}"
-```
-2. Attendre 10 minutes (outcome agent attend un minimum d’âge)
-3. Vérifier les outcomes :
-```
-curl -H "X-Admin-Token: <ADMIN_TOKEN>" "http://127.0.0.1:8081/outcomes/latest?limit=50"
-```
-4. Vérifier en SQLite :
-```
-SELECT * FROM signal_outcomes ORDER BY id DESC LIMIT 20;
-```
-
-### Spread logic (soft penalty + hard block)
-```
-HARD_SPREAD_MAX_POINTS=40
-SOFT_SPREAD_START_POINTS=20
-SOFT_SPREAD_MAX_PENALTY=30
-HARD_SPREAD_MAX_RATIO=0.12
-SOFT_SPREAD_START_RATIO=0.06
-```
-Hard block si points/ratio dépassent le max. Sinon pénalité progressive (score).
-
----
-
-### Remote MT5 (tests rapides, section Deploy)
+### Remote MT5 (tests rapides)
 ```
 curl http://137.74.116.242:8000/health
 curl "http://137.74.116.242:8000/tick?symbol=XAUUSD"
@@ -244,5 +173,4 @@ DATA_MAX_AGE_SEC=120
 
 ## Tests
 - `docker compose run --rm -w /app -e PYTHONPATH=/app -v /Users/admin/Desktop/trader-assistant:/app api pytest -q`
-
 

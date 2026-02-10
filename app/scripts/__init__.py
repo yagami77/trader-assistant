@@ -1,1 +1,1 @@
-# Scripts package
+# app.scripts
