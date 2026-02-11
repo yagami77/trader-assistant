@@ -67,6 +67,46 @@ def _price_in_zone(price: float, zone_lo: float, zone_hi: float) -> bool:
     return zone_lo <= price <= zone_hi
 
 
+def get_m5_trend(candles_m5: List[dict], direction: str, min_bars: int = 3) -> str:
+    """Retourne 'aligned' | 'against' | 'neutral' selon la tendance M5 vs direction."""
+    if not candles_m5 or len(candles_m5) < min_bars:
+        return "neutral"
+    closes = _extract_series(candles_m5, "close")
+    if len(closes) < min_bars:
+        return "neutral"
+    recent = closes[-min_bars:]
+    older = closes[-min_bars * 2 : -min_bars] if len(closes) >= min_bars * 2 else closes[:min_bars]
+    if not older:
+        return "neutral"
+    avg_recent = sum(recent) / len(recent)
+    avg_older = sum(older) / len(older)
+    diff = avg_recent - avg_older
+    if direction.upper() == "BUY":
+        if diff < -2.0:
+            return "against"
+        if diff > 2.0:
+            return "aligned"
+    else:
+        if diff > 2.0:
+            return "against"
+        if diff < -2.0:
+            return "aligned"
+    return "neutral"
+
+
+def _m5_has_one_rejection(candles_m5: List[dict], direction: str) -> bool:
+    """True si au moins 1 barre M5 (dernières 3) est un rejet dans notre direction."""
+    if not candles_m5:
+        return False
+    last_3 = candles_m5[-3:] if len(candles_m5) >= 3 else candles_m5
+    for c in last_3:
+        if direction.upper() == "BUY" and _is_rejection_candle_bullish(c):
+            return True
+        if direction.upper() == "SELL" and _is_rejection_candle_bearish(c):
+            return True
+    return False
+
+
 def evaluate_entry_timing(
     candles: List[dict],
     direction: str,
@@ -75,12 +115,13 @@ def evaluate_entry_timing(
     swing_high: Optional[float],
     current_price: Optional[float],
     zone_pts: float = 15.0,
+    candles_m5: Optional[List[dict]] = None,
 ) -> EntryTimingResult:
     """
-    Évalue si c'est le bon moment pour entrer.
-    - Zone d'entrée autour du niveau (pas un prix exact)
-    - Confirmation: bougie de rejet ou close dans la zone
-    - current_price optionnel (tick) pour savoir si on est DANS la zone maintenant
+    Setup M15, confirmation M5 : 1 barre M5 rejet valide suffit.
+    - Zone d'entrée autour du niveau (M15)
+    - Confirmation: rejet M15 ou 1 barre M5 rejet dans notre direction
+    - current_price optionnel (tick) pour savoir si on est DANS la zone
     """
     if not candles:
         return EntryTimingResult(
@@ -155,6 +196,10 @@ def evaluate_entry_timing(
             reason = (
                 f"Rejet S/R x{confirmation_count}" if confirmation_count else "Prix dans zone"
             )
+    # Confirmation M5 : 1 barre M5 rejet dans notre direction suffit (pas d'attente 2 M15)
+    if not timing_ready and candles_m5 and _m5_has_one_rejection(candles_m5, direction):
+        timing_ready = True
+        reason = f"{reason} — Confirmation M5 (1 barre)"
     return EntryTimingResult(
         setup_type=setup_type,
         entry_zone_lo=zone_lo,

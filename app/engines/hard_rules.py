@@ -50,17 +50,12 @@ def evaluate_hard_rules(
         return HardRuleResult(BlockedBy.spread_too_high, "Spread trop élevé")
     if packet.atr > packet.atr_max:
         return HardRuleResult(BlockedBy.volatility_too_high, "Volatilité trop élevée")
-    rr_min = getattr(settings, "rr_min_tp1", settings.rr_min)
-    rr_hard = getattr(settings, "rr_hard_min_tp1", 0.2)
+    # RR en scalp : NE BLOQUE PLUS sauf sécurité extrême (RR_HARD_MIN_TP1 = 0.15). RR_MIN_TP1 n'est plus une hard rule.
+    rr_hard = getattr(settings, "rr_hard_min_tp1", 0.15)
     if packet.rr_tp1 < rr_hard:
         return HardRuleResult(
             BlockedBy.rr_too_low,
             f"RR TP1 extrêmement faible ({packet.rr_tp1:.2f} < {rr_hard:.2f})",
-        )
-    if packet.rr_tp1 < rr_min:
-        return HardRuleResult(
-            BlockedBy.rr_too_low,
-            f"RR TP1 insuffisant ({packet.rr_tp1:.2f} < {rr_min:.2f})",
         )
     if is_budget_reached(state):
         return HardRuleResult(BlockedBy.daily_budget_reached, "Budget journalier atteint")

@@ -11,7 +11,9 @@ from app.infra.db import get_recent_signals
 from app.agents.news_agent import get_lock
 from app.agents.news_impact_agent import build_news_impact_summary
 from app.engines.news_timing import compute_news_timing
-from app.engines.setup_engine import detect_setups, _compute_atr
+from app.engines.setup_engine import detect_setups, SetupResult, _compute_atr
+from app.engines.scorer import score_packet
+from app.engines.entry_timing_engine import get_m5_trend
 
 
 SESSION_WINDOWS = [
@@ -104,12 +106,16 @@ def build_decision_packet(provider, symbol: str) -> DecisionPacket:
     spread = provider.get_spread(symbol)
     candles_m15 = provider.get_candles(symbol, settings.tf_signal, 80)
     candles_h1 = provider.get_candles(symbol, settings.tf_context, 100)
+    try:
+        candles_m5 = provider.get_candles(symbol, "M5", 48) if hasattr(provider, "get_candles") else []
+    except Exception:
+        candles_m5 = []
     tick = provider.get_tick(symbol) if hasattr(provider, "get_tick") else None
     current_price = float(tick[0]) if tick else None
-    setup = detect_setups(candles_m15, candles_h1, current_price)
+    setup_buy = detect_setups(candles_m15, candles_h1, current_price, direction_override="BUY", candles_m5=candles_m5 or [])
+    setup_sell = detect_setups(candles_m15, candles_h1, current_price, direction_override="SELL", candles_m5=candles_m5 or [])
     recent_m15_trend = _recent_m15_trend(candles_m15, min_pts=5.0, bars=8)
     bias_map = {"BULLISH": Bias.up, "BEARISH": Bias.down, "RANGE": Bias.range}
-    bias = bias_map.get(setup.structure_h1, Bias.up)
     news_lock, next_event, provider_ok, raw_count, lock_window = get_lock(
         now_utc,
         settings.news_lock_high_pre_min,
@@ -144,18 +150,9 @@ def build_decision_packet(provider, symbol: str) -> DecisionPacket:
     if not provider_ok:
         sources_used.append("NEWS_PROVIDER_DOWN")
 
-    entry = setup.entry
-    sl = setup.sl
-    tp1 = setup.tp1
-    tp2 = setup.tp2
-    rr_tp1 = setup.rr_tp1
-    rr_tp2 = setup.rr_tp2
     atr = _compute_atr(candles_m15) if candles_m15 else 1.1
-
     data_latency_ms = 9999
     if candles_m15:
-        # MT5 copy_rates_from_pos renvoie les bougies de la plus ancienne à la plus récente.
-        # candles_m15[-1] = dernière bougie (courante / la plus fraîche) → c'est celle qu'on utilise pour la latence.
         last = candles_m15[-1]
         last_ts = _parse_timestamp(last.get("ts") or last.get("time_msc") or last.get("time"))
         if last_ts:
@@ -163,63 +160,12 @@ def build_decision_packet(provider, symbol: str) -> DecisionPacket:
             if data_latency_ms < 0:
                 data_latency_ms = 0
 
-    return DecisionPacket(
-        session_ok=session_ok,
-        news_lock=news_lock,
-        news_next_event=(
-            {
-                "datetime_iso": next_event.datetime_iso,
-                "impact": next_event.impact,
-                "title": next_event.title,
-            }
-            if next_event
-            else None
-        ),
-        news_next_event_details=(
-            {
-                "datetime_iso": next_event.datetime_iso,
-                "impact": next_event.impact,
-                "title": next_event.title,
-                "currency": next_event.currency,
-                "country": next_event.country,
-                "actual": next_event.actual,
-                "forecast": next_event.forecast,
-                "previous": next_event.previous,
-            }
-            if next_event
-            else None
-        ),
-        spread=spread,
-        news_impact_summary=news_impact_summary,
-        spread_max=settings.spread_max,
-        atr=atr,
-        atr_max=settings.atr_max,
-        bias_h1=bias,
-        setups_detected=setup.setups,
-        proposed_entry=entry,
-        sl=sl,
-        tp1=tp1,
-        tp2=tp2,
-        rr_tp1=rr_tp1,
-        rr_tp2=rr_tp2,
-        rr_min=settings.rr_min,
-        score_rules=0,
-        reasons_rules=[],
-        sources_used=sources_used,
-        context_summary=context_summary,
-        news_state={
-            "minutes_to_event": news_timing.minutes_to_event,
-            "moment": news_timing.moment_label,
-            "horizon_minutes": news_timing.horizon_minutes,
-            "lock_active": news_timing.lock_active,
-            "lock_reason": news_timing.lock_reason,
-            "lock_window_start_min": news_timing.lock_window_start_min,
-            "lock_window_end_min": news_timing.lock_window_end_min,
-            "provider_ok": provider_ok,
-            "raw_count": raw_count,
-            "should_pre_alert": news_timing.should_pre_alert,
-            "bucket_label": news_timing.bucket_label,
-            "next_event": (
+    def _make_packet(s: SetupResult) -> DecisionPacket:
+        bias = bias_map.get(s.structure_h1, Bias.up)
+        return DecisionPacket(
+            session_ok=session_ok,
+            news_lock=news_lock,
+            news_next_event=(
                 {
                     "datetime_iso": next_event.datetime_iso,
                     "impact": next_event.impact,
@@ -228,24 +174,94 @@ def build_decision_packet(provider, symbol: str) -> DecisionPacket:
                 if next_event
                 else None
             ),
-        },
-        state={
-            "daily_budget_used": 0.0,
-            "cooldown_ok": True,
-            "setup_direction": setup.direction,
-            "setup_bar_ts": setup.bar_ts,
-            "setup_type": setup.setup_type,
-            "timing_ready": setup.timing_ready,
-            "structure_h1": setup.structure_h1,
-            "entry_timing_reason": setup.entry_timing_reason,
-            "recent_m15_trend": recent_m15_trend,
-        },
-        timestamps={
-            "ts_utc": now_utc.isoformat(),
-            "ts_paris": now_paris.isoformat(),
-        },
-        data_latency_ms=data_latency_ms,
-    )
+            news_next_event_details=(
+                {
+                    "datetime_iso": next_event.datetime_iso,
+                    "impact": next_event.impact,
+                    "title": next_event.title,
+                    "currency": next_event.currency,
+                    "country": next_event.country,
+                    "actual": next_event.actual,
+                    "forecast": next_event.forecast,
+                    "previous": next_event.previous,
+                }
+                if next_event
+                else None
+            ),
+            spread=spread,
+            news_impact_summary=news_impact_summary,
+            spread_max=settings.spread_max,
+            atr=atr,
+            atr_max=settings.atr_max,
+            bias_h1=bias,
+            setups_detected=s.setups,
+            proposed_entry=s.entry,
+            sl=s.sl,
+            tp1=s.tp1,
+            tp2=s.tp2,
+            rr_tp1=s.rr_tp1,
+            rr_tp2=s.rr_tp2,
+            rr_min=settings.rr_min,
+            score_rules=0,
+            reasons_rules=[],
+            sources_used=sources_used,
+            context_summary=context_summary,
+            news_state={
+                "minutes_to_event": news_timing.minutes_to_event,
+                "moment": news_timing.moment_label,
+                "horizon_minutes": news_timing.horizon_minutes,
+                "lock_active": news_timing.lock_active,
+                "lock_reason": news_timing.lock_reason,
+                "lock_window_start_min": news_timing.lock_window_start_min,
+                "lock_window_end_min": news_timing.lock_window_end_min,
+                "provider_ok": provider_ok,
+                "raw_count": raw_count,
+                "should_pre_alert": news_timing.should_pre_alert,
+                "bucket_label": news_timing.bucket_label,
+                "next_event": (
+                    {
+                        "datetime_iso": next_event.datetime_iso,
+                        "impact": next_event.impact,
+                        "title": next_event.title,
+                    }
+                    if next_event
+                    else None
+                ),
+            },
+            state={
+                "daily_budget_used": 0.0,
+                "cooldown_ok": True,
+                "setup_direction": s.direction,
+                "setup_bar_ts": s.bar_ts,
+                "setup_type": s.setup_type,
+                "timing_ready": s.timing_ready,
+                "structure_h1": s.structure_h1,
+                "entry_timing_reason": s.entry_timing_reason,
+                "recent_m15_trend": recent_m15_trend,
+                "m5_trend": get_m5_trend(candles_m5, s.direction),
+            },
+            timestamps={
+                "ts_utc": now_utc.isoformat(),
+                "ts_paris": now_paris.isoformat(),
+            },
+            data_latency_ms=data_latency_ms,
+        )
+
+    packet_buy = _make_packet(setup_buy)
+    packet_sell = _make_packet(setup_sell)
+    score_buy, _ = score_packet(packet_buy)
+    score_sell, _ = score_packet(packet_sell)
+    if score_buy > score_sell:
+        return packet_buy
+    if score_sell > score_buy:
+        return packet_sell
+    # Égalité : suivre la tendance H1 (BULLISH → BUY, BEARISH → SELL, RANGE → BUY par défaut)
+    structure_h1 = setup_buy.structure_h1
+    if structure_h1 == "BULLISH":
+        return packet_buy
+    if structure_h1 == "BEARISH":
+        return packet_sell
+    return packet_buy
 
 
 def build_fallback_packet(symbol: str, now_utc: Optional[datetime] = None) -> DecisionPacket:

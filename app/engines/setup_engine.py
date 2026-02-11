@@ -107,11 +107,15 @@ def detect_setups(
     candles_m15: List[dict],
     candles_h1: Optional[List[dict]] = None,
     current_price: Optional[float] = None,
+    direction_override: Optional[str] = None,
+    candles_m5: Optional[List[dict]] = None,
 ) -> SetupResult:
     """
-    Détection style pro: structure, S/R, breakout, pullback, bon moment.
+    Setup détecté M15, confirmation sur M5 (1 barre M5 valide suffit).
     - candles_h1: contexte structure (bias)
-    - current_price: tick pour savoir si on est dans la zone maintenant
+    - current_price: tick pour savoir si on est dans la zone
+    - direction_override: "BUY" ou "SELL" pour forcer la direction
+    - candles_m5: confirmation M5 (1 rejet = bon moment)
     """
     if not candles_m15:
         return SetupResult(
@@ -135,7 +139,9 @@ def detect_setups(
     last = candles_m15[-1]
     close = float(last.get("close", 4660.0)) if closes else 4660.0
     bar_ts = _parse_bar_ts(last)
-    direction = _infer_direction_from_structure(struct_h1.structure, closes)
+    direction = (direction_override or _infer_direction_from_structure(struct_h1.structure, closes)).upper()
+    if direction not in ("BUY", "SELL"):
+        direction = "BUY"
     swing_low = struct_m15.last_swing_low or (min(lows[-5:]) if len(lows) >= 5 else close - 20)
     swing_high = struct_m15.last_swing_high or (max(highs[-5:]) if len(highs) >= 5 else close + 20)
     buffer = max(2.0, (swing_high - swing_low) * 0.02) if swing_high > swing_low else 5.0
@@ -194,6 +200,7 @@ def detect_setups(
         struct_m15.last_swing_high,
         current_price,
         zone_pts=15.0,
+        candles_m5=candles_m5 or [],
     )
     if (
         timing.timing_ready

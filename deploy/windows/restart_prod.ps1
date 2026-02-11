@@ -31,15 +31,38 @@ print('DB OK')
     Pop-Location
 }
 
-# 2) Vider __pycache__ pour forcer rechargement du code
-Write-Host "`n2. Nettoyage __pycache__..."
+# 2) Cloturer le trade actif EN PREMIER (API doit etre up)
+Write-Host "`n2. Cloture setup actif (reset trade)..."
+$envLocal = Join-Path $CORE_DIR ".env.local"
+$adminToken = $null
+if (Test-Path $envLocal) {
+    $line = Get-Content $envLocal -ErrorAction SilentlyContinue | Where-Object { $_ -match "^ADMIN_TOKEN=(.+)$" } | Select-Object -First 1
+    if ($line -match "^ADMIN_TOKEN=(.+)$") { $adminToken = $Matches[1].Trim() }
+}
+if ($adminToken) {
+    try {
+        $headers = @{ "X-Admin-Token" = $adminToken }
+        $res = Invoke-WebRequest -Uri "http://127.0.0.1:8081/admin/reset-active-trade?silent=true" -Method POST -Headers $headers -TimeoutSec 5 -UseBasicParsing
+        if ($res.StatusCode -eq 200) {
+            $j = $res.Content | ConvertFrom-Json
+            Write-Host "  Reset OK: $($j.rows_cleared) trade(s) efface(s)"
+        } else { Write-Host "  Reset: status $($res.StatusCode)" }
+    } catch {
+        Write-Host "  Reset: $($_.Exception.Message) (API peut-etre arretee)"
+    }
+} else {
+    Write-Host "  ADMIN_TOKEN absent (skip)"
+}
+
+# 3) Vider __pycache__ pour forcer rechargement du code
+Write-Host "`n3. Nettoyage __pycache__..."
 Get-ChildItem -Path $CORE_DIR -Include __pycache__ -Recurse -Directory -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
 Write-Host "  __pycache__ supprime"
 
 # 3) Redemarrer services NSSM (si installes)
 $NSSM = "C:\tools\nssm\nssm.exe"
 if (Test-Path $NSSM) {
-    Write-Host "`n3. Restart services..."
+    Write-Host "`n4. Restart services..."
     # Forcer GO_MIN_SCORE=90 et A_PLUS_MIN_SCORE=90 pour trader-core (setups A+ uniquement sur Telegram)
     $stCore = & $NSSM status trader-core 2>$null
     if ($LASTEXITCODE -eq 0) {
@@ -70,7 +93,7 @@ if (Test-Path $NSSM) {
     Write-Host "   - Runner: python -m app.scripts.runner_loop --interval 300"
 }
 
-# 4) Health check + version
+# 5) Health check + version
 Write-Host "`n4. Health check..."
 Start-Sleep -Seconds 5
 try {
@@ -84,29 +107,6 @@ try {
     }
 } catch {
     Write-Host "API: $($_.Exception.Message)"
-}
-
-# 5) Reset trade actif (arreter suivi en boucle) — via API = meme DB que le service
-Write-Host "`n5. Reset trade actif..."
-$envLocal = Join-Path $CORE_DIR ".env.local"
-$adminToken = $null
-if (Test-Path $envLocal) {
-    $line = Get-Content $envLocal -ErrorAction SilentlyContinue | Where-Object { $_ -match "^ADMIN_TOKEN=(.+)$" } | Select-Object -First 1
-    if ($line -match "^ADMIN_TOKEN=(.+)$") { $adminToken = $Matches[1].Trim() }
-}
-if ($adminToken) {
-    try {
-        $headers = @{ "X-Admin-Token" = $adminToken }
-        $res = Invoke-WebRequest -Uri "http://127.0.0.1:8081/admin/reset-active-trade?silent=true" -Method POST -Headers $headers -TimeoutSec 5 -UseBasicParsing
-        if ($res.StatusCode -eq 200) {
-            $j = $res.Content | ConvertFrom-Json
-            Write-Host "  Reset OK: $($j.rows_cleared) trade(s) efface(s)"
-        } else { Write-Host "  Reset: status $($res.StatusCode)" }
-    } catch {
-        Write-Host "  Reset: $($_.Exception.Message)"
-    }
-} else {
-    Write-Host "  ADMIN_TOKEN absent dans .env.local (skip)"
 }
 
 Write-Host "`n=== Pret pour Telegram ==="

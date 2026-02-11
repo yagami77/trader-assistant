@@ -18,7 +18,7 @@ import logging
 import time
 
 import httpx
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel
 
 from app.infra import formatter
@@ -185,15 +185,61 @@ def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
     settings = get_settings()
     provider = get_provider()
     symbol = payload.symbol or settings.symbol_default
+    # Suivi en priorité : si trade actif, fetch tick+candles M15 et exécuter suivi AVANT le build packet.
+    # Évite que timeout/erreur M5 ou autre bloque l'envoi "Bravo TP1/SL" sur Telegram.
+    now_utc = datetime.now(timezone.utc)
+    day_paris = now_utc.astimezone(ZoneInfo("Europe/Paris")).strftime("%Y-%m-%d")
+    active = get_active_trade(day_paris)
+    tick_bid, tick_ask = None, None
+    candles_for_suivi = None
+    if active:
+        try:
+            if hasattr(provider, "get_tick"):
+                tick = provider.get_tick(symbol)
+                if tick:
+                    tick_bid = float(tick[0])
+                    tick_ask = float(tick[1]) if len(tick) > 1 else tick_bid
+            candles_for_suivi = provider.get_candles(symbol, settings.tf_signal, 80)
+        except Exception as e:  # noqa: BLE001
+            log.warning("Suivi préalable (tick/candles): %s", e)
+        if tick_bid is not None and candles_for_suivi:
+            dir_suivi = (active["active_direction"] or "BUY").upper()
+            price_for_suivi = float(tick_ask) if dir_suivi == "SELL" and tick_ask is not None else float(tick_bid)
+            suivi_pre = evaluate_suivi(
+                price_for_suivi,
+                active["active_direction"] or "BUY",
+                float(active["active_entry"]),
+                float(active["active_sl"]),
+                float(active["active_tp1"]),
+                float(active["active_tp2"]),
+                "RANGE",
+                candles_for_suivi,
+                news_state={},
+                sr_buffer_points=settings.sr_buffer_points,
+                active_started_ts=active.get("active_started_ts"),
+            )
+            if suivi_pre.closed:
+                already_sent = get_last_suivi_sortie_active_started_ts(day_paris) == active.get("active_started_ts")
+                if not already_sent and settings.telegram_enabled:
+                    sender = TelegramSender()
+                    result = sender.send_message(suivi_pre.message)
+                    if not result.sent:
+                        log.warning("Telegram SORTIE (suivi préalable) non envoyé: %s", result.error)
+                    else:
+                        set_last_suivi_sortie_sent(day_paris, active.get("active_started_ts"))
+                if getattr(suivi_pre, "outcome_pips", None) is not None:
+                    record_trade_outcome(day_paris, suivi_pre.outcome_pips)
+                clear_active_trade(day_paris, closed_ts=now_utc.isoformat())
+                log.info("Trade clôturé (TP/SL suivi préalable): outcome_pips=%s", getattr(suivi_pre, "outcome_pips", None))
+
     data_off = False
     data_off_reason = None
     try:
         packet = build_decision_packet(provider, symbol)
     except Exception as exc:  # noqa: BLE001 - on veut marquer DATA_OFF
-        # Après redémarrage, le bridge MT5 peut ne pas être prêt : 1 retry après 2 s évite DATA_OFF immédiat
         err_str = str(exc).lower()
         if any(x in err_str for x in ("bridge", "connection", "timeout", "mt5", "refused", "unreachable")):
-            for _ in range(2):  # 2 retries (3 tentatives au total)
+            for _ in range(2):
                 time.sleep(2)
                 try:
                     packet = build_decision_packet(provider, symbol)
@@ -211,25 +257,31 @@ def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
     now_utc = datetime.fromisoformat(packet.timestamps["ts_utc"])
     day_paris = packet.timestamps["ts_paris"].split("T")[0]
     current_price = None
-    if hasattr(provider, "get_tick"):
+    if tick_bid is not None and tick_ask is not None:
+        current_price = tick_bid
+    elif hasattr(provider, "get_tick"):
         tick = provider.get_tick(symbol)
         if tick:
-            current_price = float(tick[0])
+            tick_bid = float(tick[0])
+            tick_ask = float(tick[1]) if len(tick) > 1 else tick_bid
+            current_price = tick_bid
     active = get_active_trade(day_paris)
 
-    # Suivi : soit données OK, soit retry tick+candles si data_off mais trade actif (résilience)
-    candles = None
-    if not data_off:
+    # Suivi : soit données OK, soit retry si data_off et trade actif (on a déjà traité SORTIE en préalable si actif)
+    candles = candles_for_suivi
+    if candles is None and not data_off:
         try:
             candles = provider.get_candles(symbol, settings.tf_signal, 80)
         except Exception:  # noqa: BLE001
             pass
-    elif active:
-        # Trade actif + data_off : retry unique pour ne pas rater une SORTIE
+    elif candles is None and data_off and active:
         try:
             tick_retry = provider.get_tick(symbol) if hasattr(provider, "get_tick") else None
             candles_retry = provider.get_candles(symbol, settings.tf_signal, 80)
             if tick_retry and candles_retry:
+                if tick_bid is None:
+                    tick_bid = float(tick_retry[0])
+                    tick_ask = float(tick_retry[1]) if len(tick_retry) > 1 else tick_bid
                 current_price = float(tick_retry[0])
                 candles = candles_retry
                 data_off = False
@@ -245,8 +297,16 @@ def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
     elif candles is None:
         log.info("Suivi skippé: trade actif mais bougies indisponibles")
     else:
+        # Prix pour suivi: BID si BUY (on vend pour clôturer), ASK si SELL (on achète pour clôturer)
+        dir_suivi = (active["active_direction"] or "BUY").upper()
+        price_for_suivi = float(tick_ask) if dir_suivi == "SELL" and tick_ask is not None else (float(tick_bid) if tick_bid is not None else current_price)
+        log.debug(
+            "Suivi: prix=%s (bid=%s ask=%s) dir=%s entry=%s tp1=%s sl=%s",
+            round(price_for_suivi, 2), tick_bid, tick_ask, dir_suivi,
+            round(float(active["active_entry"]), 2), round(float(active["active_tp1"]), 2), round(float(active["active_sl"]), 2),
+        )
         suivi = evaluate_suivi(
-            current_price,
+            price_for_suivi,
             active["active_direction"] or "BUY",
             float(active["active_entry"]),
             float(active["active_sl"]),
@@ -264,9 +324,10 @@ def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
         tp1 = float(active["active_tp1"])
         dir_suivi = active["active_direction"] or "BUY"
         midpoint = entry + (tp1 - entry) / 2 if dir_suivi == "BUY" else entry - (entry - tp1) / 2
-        at_midpoint = (dir_suivi == "BUY" and current_price >= midpoint) or (dir_suivi == "SELL" and current_price <= midpoint)
+        at_midpoint = (dir_suivi == "BUY" and price_for_suivi >= midpoint) or (dir_suivi == "SELL" and price_for_suivi <= midpoint)
         if suivi.closed:
-            send_suivi = True  # SORTIE — toujours immédiat
+            already_sent = get_last_suivi_sortie_active_started_ts(day_paris) == active.get("active_started_ts")
+            send_suivi = not already_sent
         elif suivi.status == "MAINTIEN" and at_midpoint and not was_suivi_maintien_sent(day_paris):
             send_suivi = True  # MAINTIEN — une seule fois à mi-chemin TP
         elif suivi.status == "ALERTE":
@@ -302,7 +363,7 @@ def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
                 set_last_suivi_alerte_ts(day_paris, packet.timestamps["ts_utc"])
             elif suivi.status == "MAINTIEN":
                 set_suivi_maintien_sent(day_paris)
-        if suivi.closed:
+        if suivi.closed and send_suivi:
             if getattr(suivi, "outcome_pips", None) is not None:
                 record_trade_outcome(day_paris, suivi.outcome_pips)
             clear_active_trade(day_paris, closed_ts=packet.timestamps["ts_utc"])
@@ -787,33 +848,92 @@ def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
 def admin_reset_active_trade(
     x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
     silent: bool = False,
+    outcome_pips: float | None = Query(default=None, description="Résultat en points (+5 gain, -6 perte). Si fourni, utilisé tel quel. Sinon calculé au prix actuel."),
 ) -> dict:
-    """Force l'arrêt du trade en cours et de son suivi. silent=True : pas de message Telegram (ex: script de redémarrage)."""
+    """Force l'arrêt du trade en cours et de son suivi. silent=True : pas de message Telegram (ex: script de redémarrage).
+    Quand silent=False : si outcome_pips fourni, l'utilise ; sinon calcule au prix actuel. Envoie le résultat sur Telegram."""
     settings = get_settings()
     if not settings.admin_token or x_admin_token != settings.admin_token:
         raise HTTPException(status_code=401, detail="Unauthorized")
     from app.infra.db import clear_all_active_trades
-    n = clear_all_active_trades()
-    if not silent and settings.telegram_enabled and settings.telegram_chat_id:
-        msg = (
-            "🟢 TP ÉTEINT — Trade clôturé manuellement\n\n"
-            "Suivi arrêté pour ce trade. Le système reprend l'analyse."
-        )
-        try:
-            TelegramSender().send_message(msg)
-        except Exception:  # noqa: BLE001
-            pass
-    return {"ok": True, "rows_cleared": n, "message": "Trade effacé. Suivi prêt pour les prochains trades."}
+    now_utc = datetime.now(timezone.utc)
+    day_paris = now_utc.astimezone(ZoneInfo("Europe/Paris")).strftime("%Y-%m-%d")
+    active = get_active_trade(day_paris)
+    outcome_val: float | None = None
+    if not silent and active and settings.telegram_enabled and settings.telegram_chat_id:
+        entry = float(active["active_entry"])
+        direction = (active.get("active_direction") or "BUY").upper()
+        if outcome_pips is not None:
+            outcome_val = round(float(outcome_pips), 1)
+        else:
+            current_price = None
+            try:
+                provider = get_provider()
+                if hasattr(provider, "get_tick"):
+                    tick = provider.get_tick(settings.symbol_default)
+                    if tick:
+                        current_price = float(tick[0])
+            except Exception:  # noqa: BLE001
+                pass
+            if current_price is not None:
+                if direction == "BUY":
+                    outcome_val = round(current_price - entry, 1)
+                else:
+                    outcome_val = round(entry - current_price, 1)
+        if outcome_val is not None:
+            record_trade_outcome(day_paris, outcome_val)
+            clear_active_trade(day_paris, closed_ts=now_utc.isoformat())
+            if outcome_pips >= 0:
+                msg = (
+                    f"✅ Trade clôturé\n\n"
+                    f"Résultat du trade : PROFIT +{outcome_pips:.1f} point\n\n"
+                    f"Suivi arrêté. Tu peux enchaîner sur un autre trade."
+                )
+            else:
+                msg = (
+                    f"✅ Trade clôturé\n\n"
+                    f"Résultat du trade : PERTE {outcome_pips:.1f} point\n\n"
+                    f"Suivi arrêté. Tu peux enchaîner sur un autre trade."
+                )
+            try:
+                TelegramSender().send_message(msg)
+            except Exception:  # noqa: BLE001
+                pass
+            outcome_pips = outcome_val  # pour le return
+    if outcome_val is None and outcome_pips is None:
+        n = clear_all_active_trades()
+        if not silent and settings.telegram_enabled and settings.telegram_chat_id and not active:
+            msg = (
+                "🟢 Aucun trade en cours\n\n"
+                "Suivi prêt pour les prochains trades."
+            )
+            try:
+                TelegramSender().send_message(msg)
+            except Exception:  # noqa: BLE001
+                pass
+        elif not silent and settings.telegram_enabled and settings.telegram_chat_id and active:
+            msg = (
+                "🟢 Trade clôturé (prix indisponible)\n\n"
+                "Suivi arrêté. Le système reprend l'analyse."
+            )
+            try:
+                TelegramSender().send_message(msg)
+            except Exception:  # noqa: BLE001
+                pass
+        return {"ok": True, "rows_cleared": n, "message": "Trade effacé. Suivi prêt pour les prochains trades.", "outcome_pips": None}
+    return {"ok": True, "rows_cleared": 1, "message": "Trade clôturé, résultat envoyé sur Telegram.", "outcome_pips": outcome_val}
 
 
 @app.post("/trade/manual-close")
 def trade_manual_close(
     x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+    outcome_pips: float | None = Query(default=None, description="Résultat en points (+5 gain, -6 perte). Si fourni, utilisé tel quel. Sinon calculé au prix actuel."),
 ) -> dict:
     """
     À appeler quand tu as fermé le trade manuellement (ex. sur MT5).
-    Calcule les pips au prix actuel, enregistre le résultat, efface le trade actif
-    et envoie le message sur Telegram (lecture seule, pas d'input depuis Telegram).
+    - Si outcome_pips fourni (ex. ?outcome_pips=5 ou ?outcome_pips=-6) : utilise cette valeur.
+    - Sinon : calcule au prix actuel MT5.
+    Enregistre le résultat, efface le trade actif et envoie le message sur Telegram.
     """
     settings = get_settings()
     if not settings.admin_token or x_admin_token != settings.admin_token:
@@ -825,25 +945,29 @@ def trade_manual_close(
         return {"ok": True, "message": "Aucun trade en cours.", "outcome_pips": None}
     entry = float(active["active_entry"])
     direction = (active.get("active_direction") or "BUY").upper()
-    current_price = None
-    try:
-        provider = get_provider()
-        if hasattr(provider, "get_tick"):
-            tick = provider.get_tick(settings.symbol_default)
-            if tick:
-                current_price = float(tick[0])
-    except Exception:  # noqa: BLE001
-        pass
-    if current_price is None:
-        return {
-            "ok": False,
-            "message": "Prix actuel indisponible (vérifier le bridge MT5).",
-            "outcome_pips": None,
-        }
-    if direction == "BUY":
-        pnl_pips = round(current_price - entry, 1)
+    pnl_pips: float | None = None
+    if outcome_pips is not None:
+        pnl_pips = round(float(outcome_pips), 1)
     else:
-        pnl_pips = round(entry - current_price, 1)
+        current_price = None
+        try:
+            provider = get_provider()
+            if hasattr(provider, "get_tick"):
+                tick = provider.get_tick(settings.symbol_default)
+                if tick:
+                    current_price = float(tick[0])
+        except Exception:  # noqa: BLE001
+            pass
+        if current_price is None:
+            return {
+                "ok": False,
+                "message": "Prix actuel indisponible (vérifier le bridge MT5). Indique outcome_pips pour forcer le résultat.",
+                "outcome_pips": None,
+            }
+        if direction == "BUY":
+            pnl_pips = round(current_price - entry, 1)
+        else:
+            pnl_pips = round(entry - current_price, 1)
     record_trade_outcome(day_paris, pnl_pips)
     clear_active_trade(day_paris, closed_ts=now_utc.isoformat())
     if settings.telegram_enabled and settings.telegram_chat_id:

@@ -28,7 +28,7 @@ def _p(v: float) -> str:
 
 
 def _msg_sl(entry: float, sl: float, price_touched: float, direction: str) -> str:
-    """Message SORTIE SL (via bougies)."""
+    """Message SORTIE SL."""
     if direction.upper() == "BUY":
         pts = round(entry - sl, 2)
     else:
@@ -57,7 +57,7 @@ def _msg_tp1(entry: float, tp1: float, price_touched: float, direction: str) -> 
 
 
 def _msg_tp2(entry: float, tp2: float, price_touched: float, direction: str) -> str:
-    """Message SORTIE TP2 (via bougies)."""
+    """Message SORTIE TP2."""
     if direction.upper() == "BUY":
         pts = round(tp2 - entry, 2)
     else:
@@ -184,38 +184,6 @@ def _check_stagnation_near_key_zone(
     return False
 
 
-def _candles_since(candles: List[dict], started_ts_iso: Optional[str]) -> List[dict]:
-    """Filtre les bougies depuis le début du trade (started_ts_iso). Toujours triées par temps croissant."""
-    if not candles:
-        return candles
-    # Tri chronologique même sans filtre (MT5 renvoie newest-first)
-    _ts = lambda c: int(c.get("time") or c.get("time_msc") or 0) if (c.get("time") or c.get("time_msc")) else 0
-    if not started_ts_iso:
-        out = list(candles)
-        out.sort(key=_ts)
-        return out
-    try:
-        from datetime import datetime, timezone
-        start_dt = datetime.fromisoformat(started_ts_iso)
-        if start_dt.tzinfo is None:
-            start_dt = start_dt.replace(tzinfo=timezone.utc)
-        start_sec = start_dt.timestamp()
-    except (ValueError, TypeError):
-        out = list(candles)
-        out.sort(key=_ts)
-        return out
-    out = []
-    for c in candles:
-        t = c.get("time") or c.get("time_msc")
-        if t is None:
-            continue
-        ts = int(t) if int(t) < 1e12 else int(t) // 1000
-        if ts >= start_sec - 60:  # -60 s marge (bougie en cours)
-            out.append(c)
-    out.sort(key=_ts)
-    return out if out else candles
-
-
 def evaluate_suivi(
     current_price: float,
     direction: str,
@@ -242,54 +210,29 @@ def evaluate_suivi(
     last_lh = struct_m15.last_swing_high if struct_m15 else None
     sr_levels = struct_m15.sr_levels if struct_m15 else []
 
-    # --- SORTIE : prix actuel OU high/low de la DERNIÈRE bougie uniquement ---
-    # On ne regarde plus toutes les anciennes bougies, seulement la dernière en cours (comme le suivi live).
-    candles_since = _candles_since(candles_m15 or [], active_started_ts)
-    last_candle = candles_since[-1] if candles_since else (candles_m15[-1] if candles_m15 else None)
-    if last_candle:
-        h = float(last_candle.get("high", 0))
-        l_ = float(last_candle.get("low", 0))
-        if direction.upper() == "BUY":
-            if h >= tp1:
-                pts = round(tp1 - entry, 2)
-                return SuiviResult(status="SORTIE", message=_msg_tp1(entry, tp1, h, direction), closed=True, outcome_pips=pts)
-            if h >= tp2:
-                pts = round(tp2 - entry, 2)
-                return SuiviResult(status="SORTIE", message=_msg_tp2(entry, tp2, h, direction), closed=True, outcome_pips=pts)
-        else:
-            if l_ <= tp1:
-                pts = round(entry - tp1, 2)
-                return SuiviResult(status="SORTIE", message=_msg_tp1(entry, tp1, l_, direction), closed=True, outcome_pips=pts)
-            if l_ <= tp2:
-                pts = round(entry - tp2, 2)
-                return SuiviResult(status="SORTIE", message=_msg_tp2(entry, tp2, l_, direction), closed=True, outcome_pips=pts)
-
-    # --- SORTIE : prix actuel (si pas déjà détecté via bougies) ---
+    # --- SORTIE : prix actuel en temps réel touche/égale TP ou SL = sortie ---
     if direction.upper() == "BUY":
         if current_price <= sl:
             pts = round(entry - sl, 2)
             return SuiviResult(
                 status="SORTIE",
-                message=(
-                    f"😔 SL touché — trade raté\n\n"
-                    f"📊 Résultat du trade: PERTE — {pts:.1f} point\n\n"
-                    f"Prix: {_p(current_price)} | SL: {_p(sl)}\n"
-                    f"On va récupérer dans la journée, on va faire mieux !\n"
-                    f"Trade clôturé. Prochaine opportunité."
-                ),
+                message=_msg_sl(entry, sl, current_price, direction),
                 closed=True,
                 outcome_pips=-pts,
+            )
+        if current_price >= tp2:
+            pts = round(tp2 - entry, 2)
+            return SuiviResult(
+                status="SORTIE",
+                message=_msg_tp2(entry, tp2, current_price, direction),
+                closed=True,
+                outcome_pips=pts,
             )
         if current_price >= tp1:
             pts = round(tp1 - entry, 2)
             return SuiviResult(
                 status="SORTIE",
-                message=(
-                    f"🎉 Bravo ! TP1 atteint\n\n"
-                    f"📊 Résultat du trade: PROFIT +{pts:.1f} point\n\n"
-                    f"Prix: {_p(current_price)} | TP1: {_p(tp1)}\n"
-                    f"Objectif principal atteint. À la prochaine !"
-                ),
+                message=_msg_tp1(entry, tp1, current_price, direction),
                 closed=True,
                 outcome_pips=pts,
             )
@@ -298,26 +241,23 @@ def evaluate_suivi(
             pts = round(sl - entry, 2)
             return SuiviResult(
                 status="SORTIE",
-                message=(
-                    f"😔 SL touché — trade raté\n\n"
-                    f"📊 Résultat du trade: PERTE — {pts:.1f} point\n\n"
-                    f"Prix: {_p(current_price)} | SL: {_p(sl)}\n"
-                    f"On va récupérer dans la journée, on va faire mieux !\n"
-                    f"Trade clôturé. Prochaine opportunité."
-                ),
+                message=_msg_sl(entry, sl, current_price, direction),
                 closed=True,
                 outcome_pips=-pts,
+            )
+        if current_price <= tp2:
+            pts = round(entry - tp2, 2)
+            return SuiviResult(
+                status="SORTIE",
+                message=_msg_tp2(entry, tp2, current_price, direction),
+                closed=True,
+                outcome_pips=pts,
             )
         if current_price <= tp1:
             pts = round(entry - tp1, 2)
             return SuiviResult(
                 status="SORTIE",
-                message=(
-                    f"🎉 Bravo ! TP1 atteint\n\n"
-                    f"📊 Résultat du trade: PROFIT +{pts:.1f} point\n\n"
-                    f"Prix: {_p(current_price)} | TP1: {_p(tp1)}\n"
-                    f"Objectif principal atteint. À la prochaine !"
-                ),
+                message=_msg_tp1(entry, tp1, current_price, direction),
                 closed=True,
                 outcome_pips=pts,
             )

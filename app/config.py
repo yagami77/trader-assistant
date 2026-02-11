@@ -22,11 +22,11 @@ class Settings(BaseModel):
     atr_max: float = Field(default=2.0, validation_alias="ATR_MAX")
     rr_min: float = Field(default=1.5, validation_alias="RR_MIN")
     rr_min_tp1: float = Field(default=0.4, validation_alias="RR_MIN_TP1")
-    rr_hard_min_tp1: float = Field(default=0.2, validation_alias="RR_HARD_MIN_TP1")
+    rr_hard_min_tp1: float = Field(default=0.15, validation_alias="RR_HARD_MIN_TP1")  # scalp: sécurité extrême uniquement, RR ne bloque plus sinon
     sl_min_pts: float = Field(default=20.0, validation_alias="SL_MIN_PTS")
     sl_max_pts: float = Field(default=25.0, validation_alias="SL_MAX_PTS")
-    tp1_min_pts: float = Field(default=10.0, validation_alias="TP1_MIN_PTS")
-    tp1_max_pts: float = Field(default=100.0, validation_alias="TP1_MAX_PTS")
+    tp1_min_pts: float = Field(default=7.0, validation_alias="TP1_MIN_PTS")
+    tp1_max_pts: float = Field(default=15.0, validation_alias="TP1_MAX_PTS")
     tp2_enable_bonus: bool = Field(default=True, validation_alias="TP2_ENABLE_BONUS")
     tp2_max_bonus_pts: float = Field(default=60.0, validation_alias="TP2_MAX_BONUS_POINTS")
     mode_trading: str = Field(default="scalp", validation_alias="MODE_TRADING")
@@ -113,6 +113,8 @@ class Settings(BaseModel):
     # Seuils de score (GO si >= go_min_score, A+ si >= a_plus_min_score)
     go_min_score: int = Field(default=80, validation_alias="GO_MIN_SCORE")
     a_plus_min_score: int = Field(default=90, validation_alias="A_PLUS_MIN_SCORE")
+    # Pénalité quand momentum M15 est contre tendance (-15 par défaut). Mettre 0 pour ne plus pénaliser.
+    momentum_against_penalty: int = Field(default=15, validation_alias="MOMENTUM_AGAINST_PENALTY")
 
     # Approche incrémentale — confirmer le setup sur plusieurs barres
     setup_confirm_min_bars: int = Field(default=2, validation_alias="SETUP_CONFIRM_MIN_BARS")
