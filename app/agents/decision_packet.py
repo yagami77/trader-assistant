@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
 from typing import List, Optional
 from zoneinfo import ZoneInfo
@@ -97,8 +98,13 @@ def build_decision_packet(provider, symbol: str) -> DecisionPacket:
     now_utc = provider.get_server_time()
     now_paris = now_utc.astimezone(ZoneInfo("Europe/Paris"))
 
+    # Session : utiliser l'heure système (pas le tick MT5) pour éviter décalage broker.
+    # MOCK_SERVER_TIME_UTC : utilisé par les tests pour forcer une heure.
+    forced = os.environ.get("MOCK_SERVER_TIME_UTC")
+    now_for_session = datetime.fromisoformat(forced) if forced else datetime.now(timezone.utc)
+    now_paris_session = now_for_session.astimezone(ZoneInfo("Europe/Paris"))
     session_ok = settings.always_in_session or _is_in_session(
-        now_paris,
+        now_paris_session,
         settings.trading_session_mode,
         settings.market_close_start,
         settings.market_close_end,

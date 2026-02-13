@@ -26,6 +26,8 @@ class BlockedBy(str, Enum):
     data_off = "DATA_OFF"
     execution_guard = "EXECUTION_GUARD"
     setup_not_confirmed = "SETUP_NOT_CONFIRMED"
+    extension_move = "EXTENSION_MOVE"
+    state_machine_not_ready = "STATE_MACHINE_NOT_READY"
 
 
 class Bias(str, Enum):

@@ -27,7 +27,10 @@ from app.ai_client import mock_ai_decision
 from app.agents.coach_agent import build_coach_output, build_prompt, can_call_ai
 from app.config import get_settings
 from app.engines.hard_rules import evaluate_hard_rules
+from app.engines.market_phase_engine import get_market_phase
 from app.engines.news_timing import compute_news_timing
+from app.engines.structure_engine import analyze_structure
+from app.engines.trade_state_engine import check_extension_blocked, evaluate_trade_state
 from app.agents.news_agent import get_lock
 from app.engines.suivi_engine import build_suivi_situation_message, evaluate_suivi
 from app.infra.db import (
@@ -75,7 +78,14 @@ from app.models import (
 )
 from app.providers import get_provider
 from app.engines.scorer import score_packet
-from app.state_repo import get_today_state, is_cooldown_ok, update_on_decision, update_setup_context
+from app.state_repo import (
+    get_effective_cooldown_minutes,
+    get_today_state,
+    is_cooldown_ok,
+    update_on_decision,
+    update_setup_context,
+    update_smart_context,
+)
 
 log = logging.getLogger(__name__)
 
@@ -466,6 +476,49 @@ def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
         else:
             setup_confirm_count = state.setup_confirm_count
 
+    # Système intelligent (state machine, phase marché, anti-extension) — uniquement si activé
+    market_phase = None
+    trade_state = None
+    if getattr(settings, "state_machine_enabled", False) and not data_off:
+        try:
+            candles_m15_sm = provider.get_candles(symbol, settings.tf_signal, 80)
+            candles_h1_sm = provider.get_candles(symbol, settings.tf_context, 100)
+            market_phase_result = get_market_phase(candles_m15_sm, candles_h1_sm)
+            market_phase = market_phase_result.phase
+            trade_state_result = evaluate_trade_state(
+                packet.setups_detected or [],
+                packet.state.get("timing_ready", False),
+                packet.state.get("structure_h1", "RANGE"),
+                packet.state.get("setup_type", "ZONE_CONFIRMATION"),
+                packet.state.get("setup_direction", "BUY"),
+            )
+            trade_state = trade_state_result.state
+            struct = analyze_structure(candles_m15_sm)
+            dir_sm = (packet.state.get("setup_direction") or "BUY").upper()
+            structure_level = struct.last_swing_low if dir_sm == "BUY" else struct.last_swing_high
+            if structure_level is not None and current_price is not None:
+                ext_check = check_extension_blocked(
+                    current_price, structure_level, packet.atr, dir_sm
+                )
+                if ext_check.blocked:
+                    status = DecisionStatus.no_go
+                    blocked_by = BlockedBy.extension_move
+                    why = [ext_check.reason]
+            if status == DecisionStatus.go and trade_state != "READY":
+                status = DecisionStatus.no_go
+                blocked_by = BlockedBy.state_machine_not_ready
+                why = [f"State machine: {trade_state} — {trade_state_result.reason}"]
+            update_smart_context(
+                day_paris,
+                trade_state_machine=trade_state,
+                market_phase=market_phase,
+                last_breakout_level=structure_level,
+                trade_state_since_ts=packet.timestamps["ts_utc"],
+                market_phase_since_ts=packet.timestamps["ts_utc"],
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("Système intelligent: %s", e)
+
     if data_off:
         status = DecisionStatus.no_go
         blocked_by = BlockedBy.data_off
@@ -562,7 +615,8 @@ def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
                     if closed_dt.tzinfo is None:
                         closed_dt = closed_dt.replace(tzinfo=timezone.utc)
                     nw = now_utc.replace(tzinfo=timezone.utc) if now_utc.tzinfo is None else now_utc
-                    if (nw - closed_dt) < timedelta(minutes=settings.cooldown_after_trade_minutes):
+                    cooldown_min = get_effective_cooldown_minutes(state, market_phase, nw)
+                    if (nw - closed_dt) < timedelta(minutes=cooldown_min):
                         should_send = False
                 except (TypeError, ValueError):
                     pass

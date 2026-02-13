@@ -103,6 +103,15 @@ def init_db() -> None:
         ("active_started_ts", "TEXT"),
         ("last_suivi_situation_ts", "TEXT"),
         ("last_trade_closed_ts", "TEXT"),
+        # Système intelligent — state machine + contexte mémoire
+        ("trade_state_machine", "TEXT"),
+        ("trade_state_since_ts", "TEXT"),
+        ("last_structure_type", "TEXT"),
+        ("last_breakout_level", "REAL"),
+        ("last_pullback_zone_lo", "REAL"),
+        ("last_pullback_zone_hi", "REAL"),
+        ("market_phase", "TEXT"),
+        ("market_phase_since_ts", "TEXT"),
     ]:
         if col not in state_cols:
             conn.execute(f"ALTER TABLE state ADD COLUMN {col} {typ}")

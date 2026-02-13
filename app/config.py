@@ -123,6 +123,15 @@ class Settings(BaseModel):
     # Suivi — distance min entre prix et S/R pour MAINTIEN (pts)
     sr_buffer_points: float = Field(default=25.0, validation_alias="SR_BUFFER_POINTS")
 
+    # Système intelligent — state machine, phase marché, anti-extension (défaut: désactivé = comportement actuel)
+    state_machine_enabled: bool = Field(default=False, validation_alias="STATE_MACHINE_ENABLED")
+    extension_atr_threshold: float = Field(default=0.8, validation_alias="EXTENSION_ATR_THRESHOLD")
+    cooldown_consolidation_minutes: int = Field(
+        default=15, validation_alias="COOLDOWN_CONSOLIDATION_MINUTES"
+    )
+    cooldown_dynamic_enabled: bool = Field(default=False, validation_alias="COOLDOWN_DYNAMIC_ENABLED")
+    m5_rejection_min_bars: int = Field(default=1, validation_alias="M5_REJECTION_MIN_BARS")
+
     def model_post_init(self, __context: Optional[dict]) -> None:  # type: ignore[override]
         self.data_provider = str(self.data_provider).lower()
         self.market_provider = str(self.market_provider).lower()
