@@ -26,6 +26,13 @@ class StructureResult:
     pullback_to_level: Optional[float]
 
 
+@dataclass(frozen=True)
+class StrongTrendResult:
+    """Résultat détection tendance forte M15 pour EXTENSION_MOVE adaptatif."""
+    trend_direction: str  # "BUY" | "SELL" | "NONE"
+    last_trend_pivot_price: Optional[float]  # dernier HL (BUY) ou dernier LH (SELL)
+
+
 def _extract_series(candles: List[dict], key: str) -> List[float]:
     out: List[float] = []
     for c in candles:
@@ -152,3 +159,42 @@ def analyze_structure(candles: List[dict]) -> StructureResult:
         breakout_level=breakout_level,
         pullback_to_level=pullback_to_level,
     )
+
+
+def _momentum_m15_aligned(closes: List[float], direction: str, n: int = 5) -> bool:
+    """Momentum M15 aligné: récents > anciens (BUY) ou récents < anciens (SELL)."""
+    if len(closes) < n * 2:
+        return False
+    recent = sum(closes[-n:]) / n
+    older = sum(closes[-2 * n : -n]) / n
+    if direction == "BUY":
+        return recent > older
+    return recent < older
+
+
+def detect_strong_trend_m15(bars_m15: List[dict]) -> StrongTrendResult:
+    """
+    Détection tendance forte M15 pour EXTENSION_MOVE adaptatif.
+    BUY: 2 Higher High consécutifs + 2 Higher Low consécutifs + momentum M15 aligné.
+    SELL: 2 Lower Low + 2 Lower High + momentum aligné.
+    Retourne last_trend_pivot_price = dernier HL (BUY) ou dernier LH (SELL).
+    """
+    if not bars_m15 or len(bars_m15) < 10:
+        return StrongTrendResult(trend_direction="NONE", last_trend_pivot_price=None)
+    swings = detect_swings(bars_m15, lookback=2)
+    highs = sorted([s for s in swings if s.typ == "high"], key=lambda x: x.idx)
+    lows = sorted([s for s in swings if s.typ == "low"], key=lambda x: x.idx)
+    closes = _extract_series(bars_m15, "close")
+    if len(highs) < 3 or len(lows) < 3 or len(closes) < 10:
+        return StrongTrendResult(trend_direction="NONE", last_trend_pivot_price=None)
+    h1, h2, h3 = highs[-3], highs[-2], highs[-1]
+    l1, l2, l3 = lows[-3], lows[-2], lows[-1]
+    two_hh = h2.price > h1.price and h3.price > h2.price
+    two_hl = l2.price > l1.price and l3.price > l2.price
+    two_ll = l2.price < l1.price and l3.price < l2.price
+    two_lh = h2.price < h1.price and h3.price < h2.price
+    if two_hh and two_hl and _momentum_m15_aligned(closes, "BUY"):
+        return StrongTrendResult(trend_direction="BUY", last_trend_pivot_price=l3.price)
+    if two_ll and two_lh and _momentum_m15_aligned(closes, "SELL"):
+        return StrongTrendResult(trend_direction="SELL", last_trend_pivot_price=h3.price)
+    return StrongTrendResult(trend_direction="NONE", last_trend_pivot_price=None)

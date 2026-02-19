@@ -22,6 +22,7 @@ def _make_client(tmp_path, extra_env=None):
         "TELEGRAM_ENABLED",
         "TELEGRAM_BOT_TOKEN",
         "TELEGRAM_CHAT_ID",
+        "TELEGRAM_CHAT_ID_DEBUG",
         "TELEGRAM_SEND_NO_GO_IMPORTANT",
         "TELEGRAM_NO_GO_IMPORTANT_BLOCKS",
         "NEWS_CALENDAR_PATH",
@@ -68,7 +69,7 @@ def test_telegram_go_sends(monkeypatch, tmp_path):
 def test_telegram_no_go_non_important_not_sent(monkeypatch, tmp_path):
     calls = {"count": 0}
 
-    def fake_send(self, text):
+    def fake_send(self, text, chat_id=None, **kwargs):
         calls["count"] += 1
         return type("R", (), {"sent": True, "latency_ms": 5, "error": None})()
 
@@ -94,7 +95,7 @@ def test_telegram_no_go_non_important_not_sent(monkeypatch, tmp_path):
 def test_telegram_no_go_important_sent(monkeypatch, tmp_path):
     calls = {"count": 0}
 
-    def fake_send(self, text):
+    def fake_send(self, text, chat_id=None, **kwargs):
         calls["count"] += 1
         return type("R", (), {"sent": True, "latency_ms": 5, "error": None})()
 
@@ -134,7 +135,7 @@ def test_telegram_no_go_important_sent(monkeypatch, tmp_path):
 def test_telegram_duplicate_not_sent(monkeypatch, tmp_path):
     calls = {"count": 0}
 
-    def fake_send(self, text):
+    def fake_send(self, text, chat_id=None, **kwargs):
         calls["count"] += 1
         return type("R", (), {"sent": True, "latency_ms": 5, "error": None})()
 

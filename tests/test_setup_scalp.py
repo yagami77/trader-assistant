@@ -39,6 +39,8 @@ def test_tp1_clamped(monkeypatch):
 def test_sl_too_large_blocks(monkeypatch):
     """SL > SL_MAX_PTS => NO_GO + blocked_by=SL_TOO_LARGE."""
     monkeypatch.setenv("SL_MAX_PTS", "40")
+    monkeypatch.setenv("ENTRY_LIQUIDITY_HOUR_START_PARIS", "0")
+    monkeypatch.setenv("ENTRY_LIQUIDITY_HOUR_END_PARIS", "23")
     monkeypatch.setenv("TP1_MIN_PTS", "10")
     monkeypatch.setenv("TP1_MAX_PTS", "20")
     from app.config import get_settings

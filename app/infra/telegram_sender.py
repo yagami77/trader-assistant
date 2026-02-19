@@ -20,15 +20,26 @@ class TelegramSender:
     def __init__(self) -> None:
         self._settings = get_settings()
 
-    def send_message(self, text: str) -> TelegramResult:
+    def send_message(self, text: str, chat_id: Optional[str] = None) -> TelegramResult:
         if not self._settings.telegram_enabled:
-            return TelegramResult(sent=False, latency_ms=0, error=None)
+            return TelegramResult(
+                sent=False, latency_ms=0, error="TELEGRAM_ENABLED=false (processus n'a pas chargé .env?)"
+            )
 
-        if not self._settings.telegram_bot_token or not self._settings.telegram_chat_id:
+        target = (chat_id or "").strip() or self._settings.telegram_chat_id
+        if not self._settings.telegram_bot_token or not target:
             return TelegramResult(sent=False, latency_ms=0, error="Missing Telegram config")
 
+        # Normaliser le texte pour éviter erreurs d'encodage (Telegram attend UTF-8)
+        try:
+            if not isinstance(text, str):
+                text = str(text)
+            text = text.encode("utf-8", errors="replace").decode("utf-8")
+        except Exception as e:  # noqa: BLE001
+            return TelegramResult(sent=False, latency_ms=0, error=f"Encodage message: {e!s}")
+
         url = f"https://api.telegram.org/bot{self._settings.telegram_bot_token}/sendMessage"
-        payload = {"chat_id": self._settings.telegram_chat_id, "text": text}
+        payload = {"chat_id": target, "text": text}
         last_error = None
         for attempt in range(2):
             start = time.perf_counter()

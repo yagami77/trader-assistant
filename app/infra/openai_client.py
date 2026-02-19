@@ -52,5 +52,30 @@ def generate_coach_message(prompt: str) -> OpenAIResult:
     raise RuntimeError(f"OpenAI error: {last_exc}")
 
 
-# Backward-compatible alias
+def generate_analyst_message(prompt: str, max_tokens: Optional[int] = None) -> OpenAIResult:
+    """Appel OpenAI pour l'agent analyste — max_tokens élevé, explications généreuses."""
+    settings = get_settings()
+    tokens = max_tokens or getattr(settings, "ai_analyst_max_tokens", 2500)
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {settings.openai_api_key}"}
+    payload = {
+        "model": settings.ai_model,
+        "temperature": 0.3,
+        "max_tokens": tokens,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    start = time.perf_counter()
+    resp = httpx.post(url, json=payload, headers=headers, timeout=min(60, settings.ai_timeout_sec * 4))
+    resp.raise_for_status()
+    data = resp.json()
+    content = data["choices"][0]["message"]["content"]
+    usage = data.get("usage", {})
+    return OpenAIResult(
+        text=content,
+        input_tokens=int(usage.get("prompt_tokens", 0)),
+        output_tokens=int(usage.get("completion_tokens", 0)),
+        latency_ms=int((time.perf_counter() - start) * 1000),
+    )
+
+
 call_chat_completion = generate_coach_message

@@ -26,8 +26,10 @@ class BlockedBy(str, Enum):
     data_off = "DATA_OFF"
     execution_guard = "EXECUTION_GUARD"
     setup_not_confirmed = "SETUP_NOT_CONFIRMED"
+    low_liquidity = "LOW_LIQUIDITY"
     extension_move = "EXTENSION_MOVE"
     state_machine_not_ready = "STATE_MACHINE_NOT_READY"
+    room_to_target = "ROOM_TO_TARGET"
 
 
 class Bias(str, Enum):
@@ -102,3 +104,6 @@ class AnalyzeResponse(BaseModel):
     data_latency_ms: int
     ai_latency_ms: Optional[int] = None
     signal_key: str
+    telegram_sent: Optional[int] = None
+    telegram_error: Optional[str] = None
+    telegram_skip_reason: Optional[str] = None  # Pour diagnostic: pourquoi aucun message envoyé

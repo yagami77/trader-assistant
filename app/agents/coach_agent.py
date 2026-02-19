@@ -83,17 +83,6 @@ def _enrich_telegram_text(text: str, payload: Dict[str, Any]) -> str:
             ]
         )
 
-    if "explications simples" not in lower:
-        lines.extend(
-            [
-                "",
-                "🔍 Explications simples",
-                f"- RR TP1: {_format_value(packet.get('rr_tp1'))}, TP2: {_format_value(packet.get('rr_tp2'))} (plus haut = mieux)",
-                f"- Spread: {_format_value(packet.get('spread'))} (coût d'entrée), max {_format_value(packet.get('spread_max'))}",
-                f"- Volatilité (ATR): {_format_value(packet.get('atr'))}, max {_format_value(packet.get('atr_max'))}",
-                f"- Bias H1: {_format_value(packet.get('bias_h1'))} (direction dominante)",
-            ]
-        )
 
     return "\n".join(lines).strip()
 

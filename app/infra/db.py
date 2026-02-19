@@ -1,7 +1,8 @@
 import json
 import os
 import sqlite3
-from typing import Any, Dict, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional
 
 from app.config import get_settings
 
@@ -67,6 +68,10 @@ def init_db() -> None:
         conn.execute("ALTER TABLE signals ADD COLUMN telegram_latency_ms INTEGER")
     if "alert_key" not in columns:
         conn.execute("ALTER TABLE signals ADD COLUMN alert_key TEXT")
+    # Corriger blocage DATA_OFF : alert_key enregistré sans envoi → permettre retry
+    conn.execute(
+        "UPDATE signals SET alert_key = NULL WHERE alert_key LIKE 'data_off:%' AND (telegram_sent IS NULL OR telegram_sent = 0)"
+    )
     if "ai_model" not in columns:
         conn.execute("ALTER TABLE signals ADD COLUMN ai_model TEXT")
     if "ai_input_tokens" not in columns:
@@ -102,6 +107,7 @@ def init_db() -> None:
         ("last_suivi_maintien_sent", "INTEGER"),
         ("active_started_ts", "TEXT"),
         ("last_suivi_situation_ts", "TEXT"),
+        ("last_suivi_situation_signature", "TEXT"),
         ("last_trade_closed_ts", "TEXT"),
         # Système intelligent — state machine + contexte mémoire
         ("trade_state_machine", "TEXT"),
@@ -112,6 +118,14 @@ def init_db() -> None:
         ("last_pullback_zone_hi", "REAL"),
         ("market_phase", "TEXT"),
         ("market_phase_since_ts", "TEXT"),
+        # Break-even automatique après TP1
+        ("active_be_applied", "INTEGER"),
+        ("active_be_applied_ts_utc", "TEXT"),
+        ("active_tp1_partial_pts", "REAL"),
+        # Alerte invalidation (anti-fake)
+        ("active_invalid_level", "REAL"),
+        ("active_invalid_buffer_pts", "REAL"),
+        ("last_invalidation_alert_ts", "TEXT"),
     ]:
         if col not in state_cols:
             conn.execute(f"ALTER TABLE state ADD COLUMN {col} {typ}")
@@ -333,7 +347,9 @@ def get_last_go_signal(symbol: str) -> Optional[dict]:
 def _get_active_trade_for_day(conn, day_paris: str) -> Optional[dict]:
     """Trade actif pour un jour donné (interne)."""
     row = conn.execute(
-        "SELECT active_entry, active_sl, active_tp1, active_tp2, active_direction, active_started_ts FROM state WHERE day_paris = ?",
+        "SELECT active_entry, active_sl, active_tp1, active_tp2, active_direction, active_started_ts, "
+        "active_be_applied, active_be_applied_ts_utc, active_tp1_partial_pts, "
+        "active_invalid_level, active_invalid_buffer_pts, last_invalidation_alert_ts FROM state WHERE day_paris = ?",
         (day_paris,),
     ).fetchone()
     if row and row["active_entry"] is not None:
@@ -371,18 +387,57 @@ def set_active_trade(
     tp2: float,
     direction: str,
     started_ts: Optional[str] = None,
+    invalid_level: Optional[float] = None,
+    invalid_buffer_pts: Optional[float] = None,
 ) -> None:
     conn = get_conn()
     conn.execute(
         """
         UPDATE state SET active_entry=?, active_sl=?, active_tp1=?, active_tp2=?, active_direction=?,
-            last_suivi_alerte_ts=NULL, last_suivi_maintien_sent=0, active_started_ts=?, last_suivi_situation_ts=NULL
+            last_suivi_alerte_ts=NULL, last_suivi_maintien_sent=0, active_started_ts=?, last_suivi_situation_ts=NULL,
+            active_be_applied=0, active_be_applied_ts_utc=NULL,
+            active_invalid_level=?, active_invalid_buffer_pts=?, last_invalidation_alert_ts=NULL
         WHERE day_paris=?
         """,
-        (entry, sl, tp1, tp2, direction, started_ts, day_paris),
+        (entry, sl, tp1, tp2, direction, started_ts, invalid_level, invalid_buffer_pts, day_paris),
     )
     conn.commit()
     conn.close()
+
+
+def update_active_trade_sl_to_be(
+    day_paris: str,
+    entry: float,
+    direction: str,
+    offset_pts: float = 0.0,
+    be_ts_utc: Optional[str] = None,
+    tp1_partial_pts: Optional[float] = None,
+) -> bool:
+    """
+    Passe le SL au break-even (entry ± offset). Idempotent : ne fait rien si be_applied=1.
+    tp1_partial_pts: pts réalisés sur la portion clôturée au TP1 (si clôture partielle).
+    Retourne True si la mise à jour a été faite, False si déjà appliqué.
+    """
+    dir_upper = (direction or "BUY").upper()
+    if dir_upper == "BUY":
+        new_sl = entry + offset_pts
+    else:
+        new_sl = entry - offset_pts
+    ts = be_ts_utc or datetime.now(timezone.utc).isoformat()
+    partial_val = tp1_partial_pts if tp1_partial_pts is not None else 0.0
+    conn = get_conn()
+    cur = conn.execute(
+        """
+        UPDATE state SET active_sl=?, active_be_applied=1, active_be_applied_ts_utc=?,
+            active_tp1_partial_pts=?
+        WHERE day_paris=? AND (active_be_applied IS NULL OR active_be_applied=0)
+        """,
+        (new_sl, ts, partial_val if partial_val else 0.0, day_paris),
+    )
+    updated = cur.rowcount > 0
+    conn.commit()
+    conn.close()
+    return updated
 
 
 def clear_all_active_trades() -> int:
@@ -390,7 +445,10 @@ def clear_all_active_trades() -> int:
     conn = get_conn()
     cur = conn.execute(
         "UPDATE state SET active_entry=NULL, active_sl=NULL, active_tp1=NULL, active_tp2=NULL, "
-        "active_direction=NULL, last_suivi_alerte_ts=NULL, last_suivi_maintien_sent=0, active_started_ts=NULL, last_suivi_situation_ts=NULL, last_trade_closed_ts=NULL"
+        "active_direction=NULL, last_suivi_alerte_ts=NULL, last_suivi_maintien_sent=0, active_started_ts=NULL, "
+        "last_suivi_situation_ts=NULL, last_suivi_situation_signature=NULL, last_trade_closed_ts=NULL, "
+        "active_be_applied=NULL, active_be_applied_ts_utc=NULL, active_tp1_partial_pts=NULL, "
+        "active_invalid_level=NULL, active_invalid_buffer_pts=NULL, last_invalidation_alert_ts=NULL"
     )
     n = cur.rowcount if cur.rowcount >= 0 else 0
     conn.commit()
@@ -398,9 +456,9 @@ def clear_all_active_trades() -> int:
     return n
 
 
-def clear_active_trade(day_paris: str, closed_ts: Optional[str] = None) -> None:
+def clear_active_trade(day_paris: str, closed_ts: Optional[str] = None, active_started_ts: Optional[str] = None) -> None:
     """Efface le trade actif. Si closed_ts fourni (TP/SL touché), enregistre pour cooldown prochain GO.
-    Efface aujourd'hui ET hier pour ne jamais laisser un trade bloqué (ouvert en fin de journée)."""
+    Efface aujourd'hui, hier, et le jour de active_started_ts si fourni (évite trade résiduel)."""
     conn = get_conn()
     days_to_clear = [day_paris]
     try:
@@ -408,6 +466,15 @@ def clear_active_trade(day_paris: str, closed_ts: Optional[str] = None) -> None:
         dt = datetime.strptime(day_paris, "%Y-%m-%d")
         yesterday = (dt - timedelta(days=1)).strftime("%Y-%m-%d")
         days_to_clear.append(yesterday)
+        # Clôturer aussi le jour où le trade a démarré (si différent)
+        if active_started_ts:
+            try:
+                start_dt = datetime.fromisoformat(active_started_ts.replace("Z", "+00:00"))
+                start_day = start_dt.strftime("%Y-%m-%d")
+                if start_day not in days_to_clear:
+                    days_to_clear.append(start_day)
+            except (ValueError, TypeError):
+                pass
     except (ValueError, TypeError):
         pass
     for i, d in enumerate(days_to_clear):
@@ -415,13 +482,17 @@ def clear_active_trade(day_paris: str, closed_ts: Optional[str] = None) -> None:
         if use_closed_ts:
             conn.execute(
                 "UPDATE state SET active_entry=NULL, active_sl=NULL, active_tp1=NULL, active_tp2=NULL, active_direction=NULL, "
-                "last_suivi_alerte_ts=NULL, last_suivi_maintien_sent=0, active_started_ts=NULL, last_suivi_situation_ts=NULL, last_trade_closed_ts=? WHERE day_paris=?",
+                "last_suivi_alerte_ts=NULL, last_suivi_maintien_sent=0, active_started_ts=NULL, last_suivi_situation_ts=NULL, "
+                "last_trade_closed_ts=?, active_be_applied=NULL, active_be_applied_ts_utc=NULL, active_tp1_partial_pts=NULL, "
+                "active_invalid_level=NULL, active_invalid_buffer_pts=NULL, last_invalidation_alert_ts=NULL WHERE day_paris=?",
                 (closed_ts, d),
             )
         else:
             conn.execute(
                 "UPDATE state SET active_entry=NULL, active_sl=NULL, active_tp1=NULL, active_tp2=NULL, active_direction=NULL, "
-                "last_suivi_alerte_ts=NULL, last_suivi_maintien_sent=0, active_started_ts=NULL, last_suivi_situation_ts=NULL WHERE day_paris=?",
+                "last_suivi_alerte_ts=NULL, last_suivi_maintien_sent=0, active_started_ts=NULL, last_suivi_situation_ts=NULL, "
+                "last_suivi_situation_signature=NULL, active_be_applied=NULL, active_be_applied_ts_utc=NULL, active_tp1_partial_pts=NULL, "
+                "active_invalid_level=NULL, active_invalid_buffer_pts=NULL, last_invalidation_alert_ts=NULL WHERE day_paris=?",
                 (d,),
             )
     conn.commit()
@@ -491,6 +562,17 @@ def set_last_suivi_alerte_ts(day_paris: str, ts_utc: str) -> None:
     conn.close()
 
 
+def set_last_invalidation_alert_ts(day_paris: str, ts_utc: str) -> None:
+    """Enregistre l'envoi d'une alerte INVALIDATION (une fois par trade)."""
+    conn = get_conn()
+    conn.execute(
+        "UPDATE state SET last_invalidation_alert_ts=? WHERE day_paris=?",
+        (ts_utc, day_paris),
+    )
+    conn.commit()
+    conn.close()
+
+
 def get_last_suivi_situation_ts(day_paris: str) -> Optional[str]:
     """Dernier envoi d'un message « situation » suivi (pour espacement 15 min)."""
     try:
@@ -505,13 +587,33 @@ def get_last_suivi_situation_ts(day_paris: str) -> Optional[str]:
         return None
 
 
-def set_last_suivi_situation_ts(day_paris: str, ts_utc: str) -> None:
-    """Enregistre l'envoi d'un message situation suivi."""
+def get_last_suivi_situation_signature(day_paris: str) -> Optional[str]:
+    """Signature du dernier message situation envoyé (anti-spam : ne pas renvoyer si identique)."""
+    try:
+        conn = get_conn()
+        row = conn.execute(
+            "SELECT last_suivi_situation_signature FROM state WHERE day_paris = ?",
+            (day_paris,),
+        ).fetchone()
+        conn.close()
+        return row["last_suivi_situation_signature"] if row and row["last_suivi_situation_signature"] else None
+    except Exception:
+        return None
+
+
+def set_last_suivi_situation_ts(day_paris: str, ts_utc: str, signature: Optional[str] = None) -> None:
+    """Enregistre l'envoi d'un message situation suivi (ts et signature pour anti-spam)."""
     conn = get_conn()
-    conn.execute(
-        "UPDATE state SET last_suivi_situation_ts=? WHERE day_paris=?",
-        (ts_utc, day_paris),
-    )
+    if signature is not None:
+        conn.execute(
+            "UPDATE state SET last_suivi_situation_ts=?, last_suivi_situation_signature=? WHERE day_paris=?",
+            (ts_utc, signature, day_paris),
+        )
+    else:
+        conn.execute(
+            "UPDATE state SET last_suivi_situation_ts=? WHERE day_paris=?",
+            (ts_utc, day_paris),
+        )
     conn.commit()
     conn.close()
 
@@ -712,6 +814,85 @@ def get_recent_signals(symbol: str, limit: int = 20) -> list:
         return [dict(r) for r in rows]
     except Exception:
         return []
+
+
+def get_analyst_signals(days: int = 7, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Signaux des N derniers jours pour l'agent analyste (GO/NO_GO, blocked_by, score, setup)."""
+    try:
+        from zoneinfo import ZoneInfo
+        sym = symbol or get_settings().symbol_default
+        tz = ZoneInfo("Europe/Paris")
+        end = datetime.now(tz).date()
+        start = end - timedelta(days=days)
+        conn = get_conn()
+        rows = []
+        for i in range(days + 1):
+            d = (start + timedelta(days=i)).strftime("%Y-%m-%d")
+            prefix = f"{d}%"
+            for row in conn.execute(
+                """
+                SELECT ts_utc, status, blocked_by, direction, entry, sl, tp1, score_total, decision_packet_json
+                FROM signals
+                WHERE symbol = ? AND ts_utc LIKE ?
+                ORDER BY ts_utc ASC
+                """,
+                (sym, prefix),
+            ).fetchall():
+                r = dict(row)
+                setup_type = "?"
+                try:
+                    pj = r.get("decision_packet_json")
+                    if pj:
+                        p = json.loads(pj)
+                        st = p.get("state") or {}
+                        setup_type = st.get("setup_type", "?")
+                except Exception:
+                    pass
+                r["setup_type"] = setup_type
+                r["day_paris"] = d
+                rows.append(r)
+        conn.close()
+        return rows
+    except Exception:
+        return []
+
+
+def get_analyst_outcomes_by_day(days: int = 7) -> Dict[str, List[float]]:
+    """Outcomes (pips) par jour pour les N derniers jours."""
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo("Europe/Paris")
+        end = datetime.now(tz).date()
+        result: Dict[str, List[float]] = {}
+        conn = get_conn()
+        for i in range(days + 1):
+            d = (end - timedelta(days=i)).strftime("%Y-%m-%d")
+            key = f"trade_outcomes_{d}"
+            row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+            if row and row["value"]:
+                result[d] = json.loads(row["value"])
+            else:
+                result[d] = []
+        conn.close()
+        return result
+    except Exception:
+        return {}
+
+
+def save_analyst_report(report_json: str) -> None:
+    """Sauvegarde le dernier rapport analyste."""
+    conn = get_conn()
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H%M%SZ")
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+        (f"ai_analyst_report_{ts}", report_json),
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES ('ai_analyst_last_report', ?)",
+        (report_json,),
+    )
+    conn.commit()
+    conn.close()
 
 
 def insert_ai_message(ts_utc: str, symbol: str, decision: str, text: str, meta_json: Optional[str]) -> None:

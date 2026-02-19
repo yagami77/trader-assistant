@@ -23,6 +23,25 @@ def evaluate_hard_rules(
     settings = get_settings()
     if not packet.session_ok:
         return HardRuleResult(BlockedBy.out_of_session, "Hors fenêtre de trading")
+    # Heures liquides : éviter GO 0h-8h Paris (faible liquidité XAU)
+    h_start = getattr(settings, "entry_liquidity_hour_start_paris", 8)
+    h_end = getattr(settings, "entry_liquidity_hour_end_paris", 23)
+    # now_utc en heure Paris (approximation via session)
+    from zoneinfo import ZoneInfo
+    now_paris = now_utc.astimezone(ZoneInfo("Europe/Paris"))
+    h = now_paris.hour
+    if h_start <= h_end:  # ex: 8-23
+        if h < h_start or h > h_end:
+            return HardRuleResult(
+                BlockedBy.low_liquidity,
+                f"Hors heures liquides ({h}h Paris, fenêtre {h_start}h-{h_end}h)",
+            )
+    else:  # ex: 22-6 (nuit)
+        if h > h_end and h < h_start:
+            return HardRuleResult(
+                BlockedBy.low_liquidity,
+                f"Hors heures liquides ({h}h Paris)",
+            )
     if packet.news_state.get("lock_active"):
         return HardRuleResult(BlockedBy.news_lock, "News high impact")
     if packet.spread >= settings.hard_spread_max_pts:
@@ -50,8 +69,8 @@ def evaluate_hard_rules(
         return HardRuleResult(BlockedBy.spread_too_high, "Spread trop élevé")
     if packet.atr > packet.atr_max:
         return HardRuleResult(BlockedBy.volatility_too_high, "Volatilité trop élevée")
-    # RR en scalp : NE BLOQUE PLUS sauf sécurité extrême (RR_HARD_MIN_TP1 = 0.15). RR_MIN_TP1 n'est plus une hard rule.
-    rr_hard = getattr(settings, "rr_hard_min_tp1", 0.15)
+    # RR scalp : SEUL RR_HARD_MIN_TP1 peut bloquer (ex: 0.25). RR_MIN (1.5) et RR_MIN_TP1 (0.3) ne bloquent pas.
+    rr_hard = getattr(settings, "rr_hard_min_tp1", 0.25)
     if packet.rr_tp1 < rr_hard:
         return HardRuleResult(
             BlockedBy.rr_too_low,

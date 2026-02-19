@@ -47,6 +47,11 @@ class SetupResult:
     timing_ready: bool = False
     structure_h1: str = "RANGE"
     entry_timing_reason: str = ""
+    last_swing_low: Optional[float] = None
+    last_swing_high: Optional[float] = None
+    timing_step_zone_ok: Optional[bool] = None
+    timing_step_pullback_ok: Optional[bool] = None
+    timing_step_m5_ok: Optional[bool] = None
 
 
 def _extract_series(candles: List[dict], key: str) -> List[float]:
@@ -128,6 +133,9 @@ def detect_setups(
             rr_tp2=0.0,
             direction="BUY",
             bar_ts=None,
+            timing_step_zone_ok=None,
+            timing_step_pullback_ok=None,
+            timing_step_m5_ok=None,
         )
     settings = get_settings()
     atr = _compute_atr(candles_m15)
@@ -152,6 +160,12 @@ def detect_setups(
     rr_min_tp1 = getattr(settings, "rr_min_tp1", settings.rr_min)
     tp2_enable = getattr(settings, "tp2_enable_bonus", True)
     tp2_max_bonus = getattr(settings, "tp2_max_bonus_pts", 60.0)
+    tp2_max_pts = getattr(settings, "tp2_max_pts", None)  # plafond distance entrée→TP2
+
+    def _cap_bonus(b: float, r1: float) -> float:
+        if tp2_max_pts is not None:
+            return max(r1, min(tp2_max_pts, b))
+        return b
     atr_margin = atr * 0.5
 
     if direction == "BUY":
@@ -165,11 +179,10 @@ def detect_setups(
         reward1 = max(tp1_min, min(tp1_max, risk * rr_min_tp1))
         tp1 = round(entry + reward1, 2)
         if tp2_enable and _is_context_favorable(struct_h1, settings):
-            bonus = max(reward1, min(tp2_max_bonus, reward1 * 2))  # TP2 toujours >= TP1 en pts
+            bonus = _cap_bonus(max(reward1, min(tp2_max_bonus, reward1 * 2)), reward1)
             tp2 = round(entry + bonus, 2)
         else:
-            # Même sans contexte favorable, TP2 > TP1 (au moins +5 pts)
-            bonus = max(reward1 + 5, min(tp2_max_bonus, reward1 * 2))
+            bonus = _cap_bonus(max(reward1 + 5, min(tp2_max_bonus, reward1 * 2)), reward1)
             tp2 = round(entry + bonus, 2)
     else:
         entry_structure = swing_high - buffer
@@ -182,16 +195,20 @@ def detect_setups(
         reward1 = max(tp1_min, min(tp1_max, risk * rr_min_tp1))
         tp1 = round(entry - reward1, 2)
         if tp2_enable and _is_context_favorable(struct_h1, settings):
-            bonus = max(reward1, min(tp2_max_bonus, reward1 * 2))  # TP2 toujours >= TP1 en pts
+            bonus = _cap_bonus(max(reward1, min(tp2_max_bonus, reward1 * 2)), reward1)
             tp2 = round(entry - bonus, 2)
         else:
-            bonus = max(reward1 + 5, min(tp2_max_bonus, reward1 * 2))
+            bonus = _cap_bonus(max(reward1 + 5, min(tp2_max_bonus, reward1 * 2)), reward1)
             tp2 = round(entry - bonus, 2)
     risk = abs(entry - sl)
     reward1_actual = abs(tp1 - entry)
     reward2 = abs(tp2 - entry)
     rr_tp1 = reward1_actual / risk if risk > 0.01 else 0.0
     rr_tp2 = reward2 / risk if risk > 0.01 else 0.0
+    min_confirm = getattr(settings, "m5_rejection_min_bars", 2)
+    entry_timing_mode = getattr(settings, "entry_timing_mode", "classic")
+    pullback_req = getattr(settings, "pullback_require_for_setups", "BREAKOUT_RETEST,PULLBACK_SR")
+    pullback_setups = [s.strip() for s in pullback_req.split(",") if s.strip()] if pullback_req else []
     timing = evaluate_entry_timing(
         candles_m15,
         direction,
@@ -199,8 +216,14 @@ def detect_setups(
         struct_m15.last_swing_low,
         struct_m15.last_swing_high,
         current_price,
-        zone_pts=15.0,
+        atr=atr,
         candles_m5=candles_m5 or [],
+        min_confirm_bars=min_confirm,
+        entry_timing_mode=entry_timing_mode,
+        pullback_min_ratio=getattr(settings, "pullback_min_ratio", 0.30),
+        pullback_max_ratio=getattr(settings, "pullback_max_ratio", 0.50),
+        pullback_require_setups=pullback_setups or ["BREAKOUT_RETEST", "PULLBACK_SR"],
+        m5_rejection_lookback=getattr(settings, "m5_rejection_lookback_bars", 6),
     )
     if (
         timing.timing_ready
@@ -219,43 +242,45 @@ def detect_setups(
         if direction == "BUY":
             tp1 = round(entry + reward1, 2)
             if tp2_enable and _is_context_favorable(struct_h1, settings):
-                bonus = max(reward1, min(tp2_max_bonus, reward1 * 2))  # TP2 toujours >= TP1 en pts
+                bonus = _cap_bonus(max(reward1, min(tp2_max_bonus, reward1 * 2)), reward1)
                 tp2 = round(entry + bonus, 2)
             else:
-                bonus = max(reward1 + 5, min(tp2_max_bonus, reward1 * 2))
+                bonus = _cap_bonus(max(reward1 + 5, min(tp2_max_bonus, reward1 * 2)), reward1)
                 tp2 = round(entry + bonus, 2)
         else:
             tp1 = round(entry - reward1, 2)
             if tp2_enable and _is_context_favorable(struct_h1, settings):
-                bonus = max(reward1, min(tp2_max_bonus, reward1 * 2))  # TP2 toujours >= TP1 en pts
+                bonus = _cap_bonus(max(reward1, min(tp2_max_bonus, reward1 * 2)), reward1)
                 tp2 = round(entry - bonus, 2)
             else:
-                bonus = max(reward1 + 5, min(tp2_max_bonus, reward1 * 2))
+                bonus = _cap_bonus(max(reward1 + 5, min(tp2_max_bonus, reward1 * 2)), reward1)
                 tp2 = round(entry - bonus, 2)
         risk = abs(entry - sl)
         rr_tp1 = abs(tp1 - entry) / risk if risk > 0.01 else 0.0
         rr_tp2 = abs(tp2 - entry) / risk if risk > 0.01 else 0.0
 
-    # Mode scalp : on veut une entrée au marché (prix actuel), pas un ordre loin (ex: 4999 avec prix à 5024)
+    # Mode scalp : entrée au prix actuel SEULEMENT si dans la zone (évite entrées hasardeuses)
     if current_price is not None and getattr(settings, "mode_trading", "scalp") == "scalp":
-        entry = round(current_price, 2)
-        risk = max(sl_min, min(sl_max, abs(entry - sl)))
-        if direction == "BUY":
-            sl = round(entry - risk, 2)
-        else:
-            sl = round(entry + risk, 2)
-        reward1 = max(tp1_min, min(tp1_max, risk * rr_min_tp1))
-        if direction == "BUY":
-            tp1 = round(entry + reward1, 2)
-            bonus = max(reward1 + 5, min(tp2_max_bonus, reward1 * 2)) if tp2_enable else reward1
-            tp2 = round(entry + bonus, 2)
-        else:
-            tp1 = round(entry - reward1, 2)
-            bonus = max(reward1 + 5, min(tp2_max_bonus, reward1 * 2)) if tp2_enable else reward1
-            tp2 = round(entry - bonus, 2)
-        risk = abs(entry - sl)
-        rr_tp1 = abs(tp1 - entry) / risk if risk > 0.01 else 0.0
-        rr_tp2 = abs(tp2 - entry) / risk if risk > 0.01 else 0.0
+        in_zone = timing.entry_zone_lo <= current_price <= timing.entry_zone_hi
+        if in_zone and timing.timing_ready:
+            entry = round(current_price, 2)
+            risk = max(sl_min, min(sl_max, abs(entry - sl)))
+            if direction == "BUY":
+                sl = round(entry - risk, 2)
+            else:
+                sl = round(entry + risk, 2)
+            reward1 = max(tp1_min, min(tp1_max, risk * rr_min_tp1))
+            if direction == "BUY":
+                tp1 = round(entry + reward1, 2)
+                bonus = _cap_bonus(max(reward1 + 5, min(tp2_max_bonus, reward1 * 2)), reward1) if tp2_enable else reward1
+                tp2 = round(entry + bonus, 2)
+            else:
+                tp1 = round(entry - reward1, 2)
+                bonus = _cap_bonus(max(reward1 + 5, min(tp2_max_bonus, reward1 * 2)), reward1) if tp2_enable else reward1
+                tp2 = round(entry - bonus, 2)
+            risk = abs(entry - sl)
+            rr_tp1 = abs(tp1 - entry) / risk if risk > 0.01 else 0.0
+            rr_tp2 = abs(tp2 - entry) / risk if risk > 0.01 else 0.0
     setups = [timing.setup_type]
     if struct_h1.structure != "RANGE":
         setups.append(f"Structure H1 {struct_h1.structure}")
@@ -275,4 +300,9 @@ def detect_setups(
         timing_ready=timing.timing_ready,
         structure_h1=struct_h1.structure,
         entry_timing_reason=timing.reason,
+        last_swing_low=struct_m15.last_swing_low,
+        last_swing_high=struct_m15.last_swing_high,
+        timing_step_zone_ok=getattr(timing, "timing_step_zone_ok", None),
+        timing_step_pullback_ok=getattr(timing, "timing_step_pullback_ok", None),
+        timing_step_m5_ok=getattr(timing, "timing_step_m5_ok", None),
     )

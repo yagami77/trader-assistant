@@ -1,8 +1,18 @@
 import os
 from functools import lru_cache
-from typing import Optional
+from pathlib import Path
+from typing import Optional, Tuple
 
 from pydantic import AliasChoices, BaseModel, Field
+
+# Charger .env.local dès l'import du config (service NSSM peut importer config avant main)
+_env_local = Path(__file__).resolve().parents[1] / ".env.local"
+if _env_local.exists():
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(_env_local)
+    except ImportError:
+        pass
 
 
 class Settings(BaseModel):
@@ -20,28 +30,30 @@ class Settings(BaseModel):
     soft_spread_start_pts: float = Field(default=18.0, validation_alias="SOFT_SPREAD_START_PTS")
     hard_spread_max_ratio: float = Field(default=0.15, validation_alias="HARD_SPREAD_MAX_RATIO")
     atr_max: float = Field(default=2.0, validation_alias="ATR_MAX")
-    rr_min: float = Field(default=1.5, validation_alias="RR_MIN")
-    rr_min_tp1: float = Field(default=0.4, validation_alias="RR_MIN_TP1")
-    rr_hard_min_tp1: float = Field(default=0.15, validation_alias="RR_HARD_MIN_TP1")  # scalp: sécurité extrême uniquement, RR ne bloque plus sinon
+    rr_min: float = Field(default=1.5, validation_alias="RR_MIN")  # swing/non-scalp uniquement
+    rr_min_tp1: float = Field(default=0.3, validation_alias="RR_MIN_TP1")  # calcul TP1 (setup_engine)
+    rr_hard_min_tp1: float = Field(default=0.25, validation_alias="RR_HARD_MIN_TP1")  # scalp: SEUL seuil RR (blocage + score)
     sl_min_pts: float = Field(default=20.0, validation_alias="SL_MIN_PTS")
     sl_max_pts: float = Field(default=25.0, validation_alias="SL_MAX_PTS")
     tp1_min_pts: float = Field(default=7.0, validation_alias="TP1_MIN_PTS")
     tp1_max_pts: float = Field(default=15.0, validation_alias="TP1_MAX_PTS")
     tp2_enable_bonus: bool = Field(default=True, validation_alias="TP2_ENABLE_BONUS")
     tp2_max_bonus_pts: float = Field(default=60.0, validation_alias="TP2_MAX_BONUS_POINTS")
+    # TP2_MAX_PTS: plafond distance entrée→TP2 (ex: 10 = TP2 à 10 pts max). Vide = pas de plafond.
+    tp2_max_pts: Optional[float] = Field(default=None, validation_alias="TP2_MAX_PTS")
     mode_trading: str = Field(default="scalp", validation_alias="MODE_TRADING")
     cooldown_minutes: int = Field(default=20, validation_alias="COOLDOWN_MINUTES")
     suivi_alerte_interval_minutes: int = Field(
         default=2, validation_alias="SUIVI_ALERTE_INTERVAL_MINUTES"
     )
     suivi_situation_interval_minutes: int = Field(
-        default=5, validation_alias="SUIVI_SITUATION_INTERVAL_MINUTES"
+        default=2, validation_alias="SUIVI_SITUATION_INTERVAL_MINUTES"
     )
     cooldown_after_trade_minutes: int = Field(
         default=5, validation_alias="COOLDOWN_AFTER_TRADE_MINUTES"
     )
     no_go_important_cooldown_minutes: int = Field(
-        default=3, validation_alias="NO_GO_IMPORTANT_COOLDOWN_MINUTES"
+        default=2, validation_alias="NO_GO_IMPORTANT_COOLDOWN_MINUTES"
     )
     daily_summary_hour_paris: int = Field(
         default=22, validation_alias="DAILY_SUMMARY_HOUR_PARIS"
@@ -82,17 +94,22 @@ class Settings(BaseModel):
     context_api_base_url: str = Field(default="", validation_alias="CONTEXT_API_BASE_URL")
     context_api_key: str = Field(default="", validation_alias="CONTEXT_API_KEY")
     mt5_bridge_url: str = Field(default="", validation_alias="MT5_BRIDGE_URL")
+    # MT5_POSITION_SYMBOL: symbole exact MT5 pour les positions (ex. XAUUSDm, GOLD). Vide = SYMBOL_DEFAULT.
+    mt5_position_symbol: str = Field(default="", validation_alias="MT5_POSITION_SYMBOL")
     # DATA_MAX_AGE_SEC: âge max (sec) de la dernière bougie pour considérer les données OK. M15 = bougie 15 min → min 900.
     # Ne pas mettre < 900 avec TF_SIGNAL=M15 sinon DATA_OFF systématique (cf. decision_packet data_latency = bougie la plus récente).
     data_max_age_sec: int = Field(default=960, validation_alias="DATA_MAX_AGE_SEC")
-    trading_session_mode: str = Field(default="windows", validation_alias="TRADING_SESSION_MODE")
-    market_close_start: str = Field(default="23:55", validation_alias="MARKET_CLOSE_START")
-    market_close_end: str = Field(default="00:05", validation_alias="MARKET_CLOSE_END")
+    trading_session_mode: str = Field(default="market_close", validation_alias="TRADING_SESSION_MODE")  # market_close = blocage 23h-00h uniquement
+    market_close_start: str = Field(default="23:00", validation_alias="MARKET_CLOSE_START")
+    market_close_end: str = Field(default="00:00", validation_alias="MARKET_CLOSE_END")
     telegram_enabled: bool = Field(default=False, validation_alias="TELEGRAM_ENABLED")
     telegram_bot_token: str = Field(default="", validation_alias="TELEGRAM_BOT_TOKEN")
     telegram_chat_id: str = Field(default="", validation_alias="TELEGRAM_CHAT_ID")
+    telegram_chat_id_debug: str = Field(
+        default="", validation_alias="TELEGRAM_CHAT_ID_DEBUG"
+    )  # NO_GO / blocages → Debug. Vide = tout sur TELEGRAM_CHAT_ID
     telegram_send_no_go_important: bool = Field(
-        default=False, validation_alias="TELEGRAM_SEND_NO_GO_IMPORTANT"
+        default=True, validation_alias="TELEGRAM_SEND_NO_GO_IMPORTANT"
     )
     telegram_no_go_important_blocks: str = Field(
         default="NEWS_LOCK,DATA_OFF,DAILY_BUDGET_REACHED",
@@ -106,6 +123,7 @@ class Settings(BaseModel):
     ai_price_output_per_1m: float = Field(default=0.60, validation_alias="AI_PRICE_OUTPUT_PER_1M")
     ai_max_cost_eur_per_day: float = Field(default=1.0, validation_alias="AI_MAX_COST_EUR_PER_DAY")
     ai_max_tokens_per_message: int = Field(default=800, validation_alias="AI_MAX_TOKENS_PER_MESSAGE")
+    ai_analyst_max_tokens: int = Field(default=2500, validation_alias="AI_ANALYST_MAX_TOKENS")  # Pas de limite pour le rapport
     coach_language: str = Field(default="fr", validation_alias="COACH_LANGUAGE")
     coach_mode: str = Field(default="pro", validation_alias="COACH_MODE")
     fx_eurusd: float = Field(default=1.08, validation_alias="FX_EURUSD")
@@ -119,18 +137,62 @@ class Settings(BaseModel):
     # Approche incrémentale — confirmer le setup sur plusieurs barres
     setup_confirm_min_bars: int = Field(default=2, validation_alias="SETUP_CONFIRM_MIN_BARS")
     setup_entry_tolerance_pts: float = Field(default=50.0, validation_alias="SETUP_ENTRY_TOLERANCE_PTS")
+    # Zone d'entrée : ATR * mult (min/max pts). Ex: 0.3 = zone ±0.3×ATR
+    entry_zone_atr_mult: float = Field(default=0.35, validation_alias="ENTRY_ZONE_ATR_MULT")
+    entry_zone_min_pts: float = Field(default=8.0, validation_alias="ENTRY_ZONE_MIN_PTS")
+    entry_zone_max_pts: float = Field(default=25.0, validation_alias="ENTRY_ZONE_MAX_PTS")
 
     # Suivi — distance min entre prix et S/R pour MAINTIEN (pts)
     sr_buffer_points: float = Field(default=25.0, validation_alias="SR_BUFFER_POINTS")
+    # Break-even automatique après TP1 (SL = entrée ± offset, puis suivi TP2)
+    be_enabled: bool = Field(default=False, validation_alias="BE_ENABLED")
+    be_offset_pts: float = Field(default=0.0, validation_alias="BE_OFFSET_PTS")
+    # Clôture partielle au TP1 (% du volume). 50 = 50% clôturé au TP1, reste vers TP2. 0 = pas de clôture partielle.
+    tp1_close_percent: float = Field(default=50.0, validation_alias="TP1_CLOSE_PERCENT")
 
     # Système intelligent — state machine, phase marché, anti-extension (défaut: désactivé = comportement actuel)
     state_machine_enabled: bool = Field(default=False, validation_alias="STATE_MACHINE_ENABLED")
     extension_atr_threshold: float = Field(default=0.8, validation_alias="EXTENSION_ATR_THRESHOLD")
+    # Fetch M15 — PROD=200 pour impulse memory (mémoire d'impulsion sur historique long)
+    m15_fetch_bars: int = Field(default=80, validation_alias="M15_FETCH_BARS")
+    # Impulse memory — détection bougie d'impulsion (range >= ATR * mult)
+    impulse_atr_mult: float = Field(default=1.8, validation_alias="IMPULSE_ATR_MULT")
+    impulse_extension_max_atr: float = Field(default=0.8, validation_alias="IMPULSE_EXTENSION_MAX_ATR")
+    impulse_retest_tolerance_atr: float = Field(
+        default=0.35, validation_alias="IMPULSE_RETEST_TOLERANCE_ATR"
+    )
     cooldown_consolidation_minutes: int = Field(
         default=15, validation_alias="COOLDOWN_CONSOLIDATION_MINUTES"
     )
     cooldown_dynamic_enabled: bool = Field(default=False, validation_alias="COOLDOWN_DYNAMIC_ENABLED")
-    m5_rejection_min_bars: int = Field(default=1, validation_alias="M5_REJECTION_MIN_BARS")
+    m5_rejection_min_bars: int = Field(default=2, validation_alias="M5_REJECTION_MIN_BARS")
+    # Heures liquides Paris : éviter GO entre 00h et 8h (faible liquidité XAU)
+    entry_liquidity_hour_start_paris: int = Field(default=0, validation_alias="ENTRY_LIQUIDITY_HOUR_START_PARIS")  # 0h = inclut la nuit
+    entry_liquidity_hour_end_paris: int = Field(default=22, validation_alias="ENTRY_LIQUIDITY_HOUR_END_PARIS")  # 23h = phase fermeture bloquée
+
+    # Room to Target — éviter TP1 collé à S/R
+    room_to_target_enabled: bool = Field(default=False, validation_alias="ROOM_TO_TARGET_ENABLED")
+    room_to_target_mult: float = Field(default=1.3, validation_alias="ROOM_TO_TARGET_MULT")
+    room_to_target_buffer_pts: float = Field(default=2.0, validation_alias="ROOM_TO_TARGET_BUFFER_PTS")
+
+    # Pullback intelligent + rejet M5
+    entry_timing_mode: str = Field(default="classic", validation_alias="ENTRY_TIMING_MODE")
+    pullback_min_ratio: float = Field(default=0.25, validation_alias="PULLBACK_MIN_RATIO")
+    pullback_max_ratio: float = Field(default=0.55, validation_alias="PULLBACK_MAX_RATIO")
+    pullback_require_for_setups: str = Field(default="BREAKOUT_RETEST,PULLBACK_SR", validation_alias="PULLBACK_REQUIRE_FOR_SETUPS")
+    m5_rejection_lookback_bars: int = Field(default=6, validation_alias="M5_REJECTION_LOOKBACK_BARS")
+
+    # Anti-fake invalidation — alerte si structure cassée avant TP1
+    invalidation_alert_enabled: bool = Field(default=True, validation_alias="INVALIDATION_ALERT_ENABLED")
+    invalidation_buffer_pts: float = Field(default=1.5, validation_alias="INVALIDATION_BUFFER_PTS")
+
+    # Bonus Fibonacci — renforce uniquement les meilleurs setups (jamais pénalité)
+    fibo_enabled: bool = Field(default=True, validation_alias="FIBO_ENABLED")
+    fibo_bonus_points: int = Field(default=3, validation_alias="FIBO_BONUS_POINTS")
+    fibo_min_base_score: int = Field(default=87, validation_alias="FIBO_MIN_BASE_SCORE")
+    fibo_zone_min: float = Field(default=0.382, validation_alias="FIBO_ZONE_MIN")
+    fibo_zone_max: float = Field(default=0.618, validation_alias="FIBO_ZONE_MAX")
+    fibo_tolerance_atr: float = Field(default=0.15, validation_alias="FIBO_TOLERANCE_ATR")
 
     def model_post_init(self, __context: Optional[dict]) -> None:  # type: ignore[override]
         self.data_provider = str(self.data_provider).lower()
@@ -147,3 +209,20 @@ class Settings(BaseModel):
 def get_settings() -> Settings:
     values = {k: v for k, v in os.environ.items()}
     return Settings(**values)
+
+
+def get_pullback_zone_for_phase(market_phase: Optional[str], settings: Settings) -> Tuple[float, float]:
+    """
+    Zone de pullback selon market_phase :
+    - IMPULSE (ou PULLBACK) : zone stricte 30-50 %
+    - RANGE (ou CONSOLIDATION) : zone plus large 20-70 %
+    - Sinon : config (pullback_min_ratio, pullback_max_ratio)
+    """
+    if market_phase in ("IMPULSE", "PULLBACK"):
+        return (0.30, 0.50)
+    if market_phase in ("RANGE", "CONSOLIDATION"):
+        return (0.20, 0.70)
+    return (
+        getattr(settings, "pullback_min_ratio", 0.25),
+        getattr(settings, "pullback_max_ratio", 0.55),
+    )

@@ -23,16 +23,26 @@ from pydantic import BaseModel
 
 from app.infra import formatter
 from app.agents import build_decision_packet, build_fallback_packet
+from app.agents.analyst_agent import run_analyst
 from app.ai_client import mock_ai_decision
 from app.agents.coach_agent import build_coach_output, build_prompt, can_call_ai
-from app.config import get_settings
+from app.config import get_settings, get_pullback_zone_for_phase
 from app.engines.hard_rules import evaluate_hard_rules
 from app.engines.market_phase_engine import get_market_phase
 from app.engines.news_timing import compute_news_timing
-from app.engines.structure_engine import analyze_structure
-from app.engines.trade_state_engine import check_extension_blocked, evaluate_trade_state
+from app.engines.structure_engine import analyze_structure, detect_strong_trend_m15
+from app.engines.trade_state_engine import (
+    check_extension_blocked,
+    evaluate_trade_state,
+    is_pullback_confirmed,
+)
+from app.engines.room_to_target_engine import evaluate_room_to_target
 from app.agents.news_agent import get_lock
-from app.engines.suivi_engine import build_suivi_situation_message, evaluate_suivi
+from app.engines.suivi_engine import (
+    build_suivi_situation_message,
+    compute_suivi_situation_signature,
+    evaluate_suivi,
+)
 from app.infra.db import (
     add_ai_usage,
     clear_active_trade,
@@ -47,11 +57,14 @@ from app.infra.db import (
     record_trade_outcome,
     get_last_go_sent_today,
     get_last_suivi_alerte_ts,
+    get_last_suivi_situation_signature,
+    get_last_suivi_situation_ts,
     get_last_telegram_sent_ts,
     init_db,
     insert_ai_message,
     insert_signal,
     set_active_trade,
+    update_active_trade_sl_to_be,
     set_last_suivi_alerte_ts,
     set_last_suivi_sortie_sent,
     set_daily_summary_sent,
@@ -66,6 +79,7 @@ from app.infra.db import (
     was_suivi_maintien_sent,
     was_telegram_sent,
 )
+from app.infra.mt5_be_client import mt5_modify_sl_to_be, mt5_close_partial_at_tp1
 from app.infra.telegram_sender import TelegramSender
 from app.models import (
     AnalyzeRequest,
@@ -131,7 +145,17 @@ class CoachPreviewRequest(BaseModel):
 
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok"}
+    settings = get_settings()
+    telegram_ok = bool(
+        settings.telegram_enabled
+        and settings.telegram_bot_token
+        and (settings.telegram_chat_id or settings.telegram_chat_id_debug)
+    )
+    return {
+        "status": "ok",
+        "telegram_configured": telegram_ok,
+        "telegram_enabled": settings.telegram_enabled,
+    }
 
 
 @app.get("/runner/status")
@@ -215,6 +239,10 @@ def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
         if tick_bid is not None and candles_for_suivi:
             dir_suivi = (active["active_direction"] or "BUY").upper()
             price_for_suivi = float(tick_ask) if dir_suivi == "SELL" and tick_ask is not None else float(tick_bid)
+            be_enabled = getattr(settings, "be_enabled", False)
+            be_applied = bool(active.get("active_be_applied"))
+            be_offset = getattr(settings, "be_offset_pts", 0.0)
+            tp1_close_pct_pre = getattr(settings, "tp1_close_percent", 0.0)
             suivi_pre = evaluate_suivi(
                 price_for_suivi,
                 active["active_direction"] or "BUY",
@@ -227,20 +255,53 @@ def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
                 news_state={},
                 sr_buffer_points=settings.sr_buffer_points,
                 active_started_ts=active.get("active_started_ts"),
+                be_enabled=be_enabled,
+                be_applied=be_applied,
+                be_offset_pts=be_offset,
+                tp1_close_percent=tp1_close_pct_pre if be_enabled else 0.0,
             )
-            if suivi_pre.closed:
+            if suivi_pre.status == "TP1_BE" and be_enabled:
+                entry_val = float(active["active_entry"])
+                dir_val = active["active_direction"] or "BUY"
+                new_sl = entry_val + be_offset if dir_val.upper() == "BUY" else entry_val - be_offset
+                updated = update_active_trade_sl_to_be(
+                    day_paris,
+                    entry_val,
+                    dir_val,
+                    offset_pts=be_offset,
+                    be_ts_utc=now_utc.isoformat(),
+                )
+                if updated:
+                    if getattr(settings, "market_provider", "").lower() == "remote_mt5":
+                        mt5_modify_sl_to_be(symbol, new_sl, dir_val)
+                    if settings.telegram_enabled:
+                        try:
+                            TelegramSender().send_message(suivi_pre.message)
+                        except Exception:  # noqa: BLE001
+                            pass
+                    log.info("TP1 atteint — SL passé à BE pour %s", day_paris)
+            elif suivi_pre.closed:
                 already_sent = get_last_suivi_sortie_active_started_ts(day_paris) == active.get("active_started_ts")
                 if not already_sent and settings.telegram_enabled:
                     sender = TelegramSender()
                     result = sender.send_message(suivi_pre.message)
                     if not result.sent:
                         log.warning("Telegram SORTIE (suivi préalable) non envoyé: %s", result.error)
+                        # TODO (nuit / marché fermé): retry 1–2x ici
                     else:
+                        log.info("Telegram SORTIE envoyé (suivi préalable) day=%s", day_paris)
                         set_last_suivi_sortie_sent(day_paris, active.get("active_started_ts"))
                 if getattr(suivi_pre, "outcome_pips", None) is not None:
                     record_trade_outcome(day_paris, suivi_pre.outcome_pips)
-                clear_active_trade(day_paris, closed_ts=now_utc.isoformat())
+                clear_active_trade(
+                    day_paris,
+                    closed_ts=now_utc.isoformat(),
+                    active_started_ts=active.get("active_started_ts"),
+                )
                 log.info("Trade clôturé (TP/SL suivi préalable): outcome_pips=%s", getattr(suivi_pre, "outcome_pips", None))
+        # Re-fetch active après préalable (au cas où on a clôturé) pour éviter double suivi
+        if tick_bid is not None and candles_for_suivi:
+            active = get_active_trade(day_paris)
 
     data_off = False
     data_off_reason = None
@@ -281,7 +342,8 @@ def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
     candles = candles_for_suivi
     if candles is None and not data_off:
         try:
-            candles = provider.get_candles(symbol, settings.tf_signal, 80)
+            m15_bars = getattr(settings, "m15_fetch_bars", 80)
+            candles = provider.get_candles(symbol, settings.tf_signal, m15_bars)
         except Exception:  # noqa: BLE001
             pass
     elif candles is None and data_off and active:
@@ -315,6 +377,10 @@ def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
             round(price_for_suivi, 2), tick_bid, tick_ask, dir_suivi,
             round(float(active["active_entry"]), 2), round(float(active["active_tp1"]), 2), round(float(active["active_sl"]), 2),
         )
+        be_enabled = getattr(settings, "be_enabled", False)
+        be_applied = bool(active.get("active_be_applied"))
+        be_offset = getattr(settings, "be_offset_pts", 0.0)
+        tp1_close_percent = getattr(settings, "tp1_close_percent", 0.0)
         suivi = evaluate_suivi(
             price_for_suivi,
             active["active_direction"] or "BUY",
@@ -327,15 +393,39 @@ def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
             news_state=packet.news_state,
             sr_buffer_points=settings.sr_buffer_points,
             active_started_ts=active.get("active_started_ts"),
+            be_enabled=be_enabled,
+            be_applied=be_applied,
+            be_offset_pts=be_offset,
+            tp1_close_percent=tp1_close_percent if be_enabled else 0.0,
         )
-        # SORTIE: immédiat. ALERTE: 1x (pas de relance). MAINTIEN: 1x à mi-chemin TP si critères OK
+        # SORTIE: immédiat. TP1_BE: SL à BE puis suivi TP2. ALERTE: 1x. INVALIDATION: 1x. MAINTIEN: 1x à mi-chemin TP
         send_suivi = False
+        invalidation_sent = False
         entry = float(active["active_entry"])
         tp1 = float(active["active_tp1"])
         dir_suivi = active["active_direction"] or "BUY"
         midpoint = entry + (tp1 - entry) / 2 if dir_suivi == "BUY" else entry - (entry - tp1) / 2
         at_midpoint = (dir_suivi == "BUY" and price_for_suivi >= midpoint) or (dir_suivi == "SELL" and price_for_suivi <= midpoint)
-        if suivi.closed:
+        if suivi.status == "TP1_BE" and be_enabled:
+            # BE = entrée ± offset, jamais TP1
+            new_sl = entry + be_offset if dir_suivi.upper() == "BUY" else entry - be_offset
+            updated = update_active_trade_sl_to_be(
+                day_paris,
+                entry,
+                dir_suivi,
+                offset_pts=be_offset,
+                be_ts_utc=packet.timestamps["ts_utc"],
+            )
+            if updated:
+                if getattr(settings, "market_provider", "").lower() == "remote_mt5":
+                    ok = mt5_modify_sl_to_be(symbol, new_sl, dir_suivi)
+                    if not ok:
+                        log.warning("MT5 modify SL to BE failed — déplace le SL manuellement à %.2f", new_sl)
+                else:
+                    log.info("MARKET_PROVIDER != remote_mt5 — déplace le SL manuellement à %.2f (BE)", new_sl)
+                send_suivi = True
+                log.info("TP1 atteint — SL passé à BE (entrée=%.2f) pour %s", entry, day_paris)
+        elif suivi.closed:
             already_sent = get_last_suivi_sortie_active_started_ts(day_paris) == active.get("active_started_ts")
             send_suivi = not already_sent
         elif suivi.status == "MAINTIEN" and at_midpoint and not was_suivi_maintien_sent(day_paris):
@@ -357,26 +447,77 @@ def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
                 last_alerte = get_last_suivi_alerte_ts(day_paris)
                 if last_alerte is None:
                     send_suivi = True  # première (et unique) alerte pour ce trade
+        # Anti-fake INVALIDATION : structure cassée avant TP1 → alerte une fois par trade
+        elif getattr(settings, "invalidation_alert_enabled", False):
+            inv_level = active.get("active_invalid_level")
+            inv_buffer = float(active.get("active_invalid_buffer_pts") or 1.5)
+            tp1_reached = be_applied or (dir_suivi == "BUY" and price_for_suivi >= tp1) or (dir_suivi == "SELL" and price_for_suivi <= tp1)
+            if inv_level is not None and not tp1_reached:
+                inv_level_f = float(inv_level)
+                crossed = (dir_suivi == "BUY" and price_for_suivi < inv_level_f - inv_buffer) or (dir_suivi == "SELL" and price_for_suivi > inv_level_f + inv_buffer)
+                last_inv = active.get("last_invalidation_alert_ts")
+                if crossed and last_inv is None:
+                    send_suivi = True
+                    invalidation_sent = True
+                    msg_to_send = (
+                        "⚠️ ALERTE INVALIDATION — sortie conseillée\n\n"
+                        f"Structure cassée avant TP1. Prix: {price_for_suivi:.2f} | Niveau invalide: {inv_level_f:.2f}\n"
+                        f"Entrée: {entry:.2f} | SL: {float(active['active_sl']):.2f} | TP1: {tp1:.2f}\n\n"
+                        "Sortie conseillée pour limiter la perte."
+                    )
         now_paris = now_utc.astimezone(ZoneInfo("Europe/Paris"))
         wd, h, m = now_paris.weekday(), now_paris.hour, now_paris.minute
         is_weekend = (wd == 4 and h >= 23) or (wd == 5) or (wd == 6) or (wd == 0 and h == 0 and m < 1)
         # SORTIE (trade fermé) : toujours envoyer gains/pertes, même hors session ou weekend
         session_ok_or_closed = packet.session_ok and not is_weekend or suivi.closed
+        if not invalidation_sent:
+            msg_to_send = suivi.message
+        if send_suivi and suivi.closed:
+            partial_pts = float(active.get("active_tp1_partial_pts") or 0)
+            remainder_pts = float(getattr(suivi, "outcome_pips", 0) or 0)
+            total_outcome = round(partial_pts + remainder_pts, 1)
+            if partial_pts > 0 and remainder_pts > 0:
+                msg_to_send = (
+                    f"🎉 Bravo ! TP2 atteint\n\n"
+                    f"📊 Résultat du trade: PROFIT +{total_outcome:.1f} point\n"
+                    f"(dont +{partial_pts:.1f} pts au TP1, +{remainder_pts:.1f} pts au TP2)\n\n"
+                    f"Trade réussi, objectif + bonus. À la prochaine !"
+                )
+            elif partial_pts > 0 and remainder_pts <= 0:
+                msg_to_send = (
+                    f"✅ Trade clôturé (SL BE)\n\n"
+                    f"📊 Résultat du trade: PROFIT +{partial_pts:.1f} point (portion TP1)\n\n"
+                    f"Suivi arrêté. Tu peux enchaîner sur un autre trade."
+                )
         if send_suivi and settings.telegram_enabled and session_ok_or_closed:
             sender = TelegramSender()
-            result = sender.send_message(suivi.message)
+            result = sender.send_message(msg_to_send)
             if suivi.closed and not result.sent:
                 log.warning("Telegram SORTIE non envoyé: %s", result.error)
+                # TODO (nuit / marché fermé): retry 1–2x ici
+            if suivi.closed and result.sent:
+                log.info("Telegram SORTIE envoyé (Bravo TP2/SL) day=%s", day_paris)
             if suivi.closed:
                 set_last_suivi_sortie_sent(day_paris, active.get("active_started_ts"))
             if suivi.status == "ALERTE" and not suivi.closed:
                 set_last_suivi_alerte_ts(day_paris, packet.timestamps["ts_utc"])
+            if invalidation_sent:
+                set_last_invalidation_alert_ts(day_paris, packet.timestamps["ts_utc"])
             elif suivi.status == "MAINTIEN":
                 set_suivi_maintien_sent(day_paris)
-        if suivi.closed and send_suivi:
-            if getattr(suivi, "outcome_pips", None) is not None:
-                record_trade_outcome(day_paris, suivi.outcome_pips)
-            clear_active_trade(day_paris, closed_ts=packet.timestamps["ts_utc"])
+        if suivi.closed:
+            if send_suivi:
+                _partial = float(active.get("active_tp1_partial_pts") or 0)
+                _remainder = float(getattr(suivi, "outcome_pips", 0) or 0)
+                _total = round(_partial + _remainder, 1)
+                if getattr(suivi, "outcome_pips", None) is not None or _partial != 0:
+                    record_trade_outcome(day_paris, _total)
+            # Toujours clôturer le trade quand TP2 ou SL atteint (évite de renvoyer le même setup)
+            clear_active_trade(
+                day_paris,
+                closed_ts=packet.timestamps["ts_utc"],
+                active_started_ts=active.get("active_started_ts"),
+            )
             log.info("Trade clôturé (TP/SL): outcome_pips=%s", getattr(suivi, "outcome_pips", None))
         # Message situation (durée, prix, tendance, score, analyse, recommandation) au plus toutes les 5 min
         elif not send_suivi and settings.telegram_enabled and packet.session_ok and not is_weekend:
@@ -409,29 +550,45 @@ def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
                 structure_m15_ok = suivi.status == "MAINTIEN"
                 score_sit, _ = score_packet(packet)
                 if suivi.status == "MAINTIEN":
-                    analysis_summary = "Tout va bien, on est dans le bon sens."
+                    analysis_summary = "On est dans le bon sens."
                     recommendation = ""
                 elif suivi.status == "ALERTE" and not structure_m15_ok:
-                    analysis_summary = "Sens inverse ou résistance, situation a changé."
-                    recommendation = "Si bénéfique, fermer. Sinon accepter un peu de dégâts et sortir du trade."
+                    sl_val = float(active["active_sl"])
+                    dist_to_sl = abs(price_for_suivi - sl_val)
+                    if dist_to_sl <= 5:
+                        analysis_summary = f"Risque contournement élevé — {dist_to_sl:.1f} pts jusqu'au SL."
+                        recommendation = "Option: réduire le SL pour limiter le risque, ou maintenir."
+                    else:
+                        analysis_summary = "M15 en consolidation."
+                        recommendation = ""
                 else:
-                    analysis_summary = "Contournement de la situation (zone sensible)."
+                    analysis_summary = "Zone sensible détectée."
                     recommendation = ""
-                msg_sit = build_suivi_situation_message(
+                sig = compute_suivi_situation_signature(
                     dir_suivi,
                     entry,
                     current_price,
-                    tp1,
-                    float(active["active_sl"]),
                     packet.state.get("structure_h1", "RANGE"),
                     structure_m15_ok,
-                    duration_min,
-                    score_total=score_sit,
-                    analysis_summary=analysis_summary,
-                    recommendation=recommendation,
+                    analysis_summary,
                 )
-                TelegramSender().send_message(msg_sit)
-                set_last_suivi_situation_ts(day_paris, packet.timestamps["ts_utc"])
+                last_sig = get_last_suivi_situation_signature(day_paris)
+                if sig != last_sig:
+                    msg_sit = build_suivi_situation_message(
+                        dir_suivi,
+                        entry,
+                        current_price,
+                        tp1,
+                        float(active["active_sl"]),
+                        packet.state.get("structure_h1", "RANGE"),
+                        structure_m15_ok,
+                        duration_min,
+                        score_total=score_sit,
+                        analysis_summary=analysis_summary,
+                        recommendation=recommendation,
+                    )
+                    TelegramSender().send_message(msg_sit)
+                    set_last_suivi_situation_ts(day_paris, packet.timestamps["ts_utc"], signature=sig)
     if not data_off and packet.data_latency_ms > settings.data_max_age_sec * 1000:
         data_off = True
         data_off_reason = "Data trop ancienne"
@@ -479,9 +636,15 @@ def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
     # Système intelligent (state machine, phase marché, anti-extension) — uniquement si activé
     market_phase = None
     trade_state = None
+    extension_distance_pts = None
+    scoring_reference_level = None
+    scoring_current_price = current_price
+    rtt = None
     if getattr(settings, "state_machine_enabled", False) and not data_off:
         try:
-            candles_m15_sm = provider.get_candles(symbol, settings.tf_signal, 80)
+            m15_bars = getattr(settings, "m15_fetch_bars", 80)
+            candles_m15_sm = provider.get_candles(symbol, settings.tf_signal, m15_bars)
+            log.info("M15 candles fetched = %d", len(candles_m15_sm))
             candles_h1_sm = provider.get_candles(symbol, settings.tf_context, 100)
             market_phase_result = get_market_phase(candles_m15_sm, candles_h1_sm)
             market_phase = market_phase_result.phase
@@ -496,14 +659,60 @@ def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
             struct = analyze_structure(candles_m15_sm)
             dir_sm = (packet.state.get("setup_direction") or "BUY").upper()
             structure_level = struct.last_swing_low if dir_sm == "BUY" else struct.last_swing_high
+            impulse_mem = packet.state.get("impulse_memory")
+            setup_type_sm = packet.state.get("setup_type", "ZONE_CONFIRMATION")
+            timing_ready_sm = packet.state.get("timing_ready", False)
+            strong_trend = detect_strong_trend_m15(candles_m15_sm)
+            strong_trend_detected = (
+                strong_trend.trend_direction == dir_sm
+                and strong_trend.last_trend_pivot_price is not None
+            )
+            timing_m5_ok = bool(packet.state.get("timing_step_m5_ok"))
+            if getattr(settings, "entry_timing_mode", "classic") != "pullback_m5":
+                timing_m5_ok = timing_m5_ok or timing_ready_sm
+            pb_min, pb_max = get_pullback_zone_for_phase(market_phase, settings)
+            pullback_confirmed = is_pullback_confirmed(
+                dir_sm,
+                packet.proposed_entry or 0.0,
+                struct.last_swing_low,
+                struct.last_swing_high,
+                timing_ready_sm,
+                timing_m5_ok,
+                setup_type_sm,
+                min_ratio=pb_min,
+                max_ratio=pb_max,
+                buffer_pts=getattr(settings, "invalidation_buffer_pts", 1.5),
+            )
             if structure_level is not None and current_price is not None:
                 ext_check = check_extension_blocked(
-                    current_price, structure_level, packet.atr, dir_sm
+                    current_price,
+                    structure_level,
+                    packet.atr,
+                    dir_sm,
+                    impulse_memory=impulse_mem,
+                    setup_type=setup_type_sm,
+                    timing_ready=timing_ready_sm,
+                    strong_trend_detected=strong_trend_detected,
+                    strong_trend_pivot_price=strong_trend.last_trend_pivot_price,
+                    pullback_confirmed=pullback_confirmed,
                 )
+                extension_distance_pts = ext_check.distance_pts
+                scoring_reference_level = ext_check.reference_level
                 if ext_check.blocked:
                     status = DecisionStatus.no_go
                     blocked_by = BlockedBy.extension_move
                     why = [ext_check.reason]
+                    log.info(
+                        "EXTENSION_MOVE blocked: current_price=%.2f reference_level=%s distance_pts=%.1f atr=%.1f "
+                        "strong_trend_detected=%s pullback_confirmed=%s final_decision=%s",
+                        current_price,
+                        ext_check.reference_level,
+                        ext_check.distance_pts,
+                        packet.atr,
+                        ext_check.strong_trend_detected,
+                        ext_check.pullback_confirmed,
+                        ext_check.final_decision,
+                    )
             if status == DecisionStatus.go and trade_state != "READY":
                 status = DecisionStatus.no_go
                 blocked_by = BlockedBy.state_machine_not_ready
@@ -518,6 +727,39 @@ def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
             )
         except Exception as e:  # noqa: BLE001
             log.warning("Système intelligent: %s", e)
+
+    # Contexte pour scoring (room_to_target si activé)
+    room_to_target_ok = True
+    if getattr(settings, "room_to_target_enabled", False) and not data_off:
+        try:
+            m15_bars_rt = getattr(settings, "m15_fetch_bars", 80)
+            candles_rt = provider.get_candles(symbol, settings.tf_signal, m15_bars_rt)
+            struct_rt = analyze_structure(candles_rt)
+            dir_rt = (packet.state.get("setup_direction") or "BUY").upper()
+            rtt = evaluate_room_to_target(
+                dir_rt,
+                packet.proposed_entry or 0,
+                packet.tp1 or 0,
+                struct_rt.sr_levels or [],
+                packet.atr,
+                mult=getattr(settings, "room_to_target_mult", 1.3),
+                buffer_pts=getattr(settings, "room_to_target_buffer_pts", 2.0),
+            )
+            room_to_target_ok = rtt.ok
+        except Exception:  # noqa: BLE001
+            room_to_target_ok = True
+
+    score_total, reasons = score_packet(
+        packet,
+        market_phase=market_phase,
+        room_to_target_ok=room_to_target_ok,
+        extension_distance_pts=extension_distance_pts,
+        _debug_current_price=scoring_current_price,
+        _debug_reference_level=scoring_reference_level,
+    )
+    packet.score_rules = score_total
+    packet.reasons_rules = reasons
+    why = reasons[:3] if reasons else []
 
     if data_off:
         status = DecisionStatus.no_go
@@ -535,6 +777,37 @@ def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
             status = DecisionStatus.no_go
             blocked_by = BlockedBy.no_setup
             why = ["Score insuffisant"]
+        elif getattr(settings, "room_to_target_enabled", False):
+            if rtt is None:
+                m15_bars_rt = getattr(settings, "m15_fetch_bars", 80)
+                candles_rt = provider.get_candles(symbol, settings.tf_signal, m15_bars_rt)
+                struct_rt = analyze_structure(candles_rt)
+                dir_rt = (packet.state.get("setup_direction") or "BUY").upper()
+                rtt = evaluate_room_to_target(
+                    dir_rt,
+                    packet.proposed_entry or 0,
+                    packet.tp1 or 0,
+                    struct_rt.sr_levels or [],
+                    packet.atr,
+                    mult=getattr(settings, "room_to_target_mult", 1.3),
+                    buffer_pts=getattr(settings, "room_to_target_buffer_pts", 2.0),
+                )
+            if not rtt.ok:
+                status = DecisionStatus.no_go
+                blocked_by = BlockedBy.room_to_target
+                mult_rt = getattr(settings, "room_to_target_mult", 1.3)
+                why = [f"Room to target insuffisant: {rtt.room_pts:.1f} < {rtt.tp1_distance_pts * mult_rt:.1f}"]
+                log.info(
+                    "ROOM_TO_TARGET: entry=%.2f tp1=%.2f next_level=%s room_pts=%.1f tp1_pts=%.1f mult=%.2f",
+                    packet.proposed_entry or 0, packet.tp1 or 0, rtt.next_level, rtt.room_pts, rtt.tp1_distance_pts, mult_rt,
+                )
+            else:
+                timing_ready = packet.state.get("timing_ready", False)
+                min_bars = settings.setup_confirm_min_bars
+                if not timing_ready and setup_confirm_count < min_bars:
+                    status = DecisionStatus.no_go
+                    blocked_by = BlockedBy.setup_not_confirmed
+                    why = [f"En attente du bon moment (zone/pullback) — {setup_confirm_count}/{min_bars} barres"]
         else:
             timing_ready = packet.state.get("timing_ready", False)
             min_bars = settings.setup_confirm_min_bars
@@ -593,9 +866,13 @@ def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
 
     # Calculer should_send AVANT l'appel Coach AI (économie d'API)
     # En suivi (trade actif) : pas de GO ni NO_GO, uniquement MAINTIEN/ALERTE/SORTIE
-    if get_active_trade(day_paris):
+    active_trade = get_active_trade(day_paris)
+    no_send_reason_detail = None  # "trade_actif" si bloqué par un trade en cours
+    if active_trade:
         should_send = False
         heartbeat_triggered = False
+        no_send_reason_detail = "trade_actif"
+        log.info("Pas d'envoi Telegram: trade actif en cours (GO/NO_GO bloqués jusqu'à clôture ou reset)")
     else:
         important_blocks = {
             item.strip().upper()
@@ -676,10 +953,41 @@ def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
                 if now_dt - last_dt >= timedelta(minutes=settings.cooldown_minutes):
                     should_send = True
                     heartbeat_triggered = True
+    if not should_send and status == DecisionStatus.no_go and not active_trade:
+        reason_why = "TELEGRAM_SEND_NO_GO_IMPORTANT désactivé"
+        if settings.telegram_send_no_go_important:
+            reason_why = "cooldown ou bloc non important"
+        log.info(
+            "NO_GO non envoyé: %s (blocked_by=%s)",
+            reason_why,
+            blocked_by.value if blocked_by else "?",
+        )
     if should_send and blocked_by == BlockedBy.duplicate_signal:
         should_send = False
     if should_send and was_telegram_sent(signal_key):
         should_send = False
+    # Safeguard : ne pas envoyer un GO "en retard" (prix déjà passé TP1 — trade inutile)
+    if should_send and status == DecisionStatus.go and current_price is not None:
+        entry = packet.proposed_entry
+        tp1 = packet.tp1
+        direction = (packet.state.get("setup_direction") or "BUY").upper()
+        if entry is not None and tp1 is not None:
+            try:
+                tp1_f = float(tp1)
+                if direction == "BUY" and current_price >= tp1_f:
+                    should_send = False
+                    log.info(
+                        "GO bloqué (prix en retard): BUY prix=%.2f >= TP1=%.2f — trade inutile",
+                        current_price, tp1_f,
+                    )
+                elif direction == "SELL" and current_price <= tp1_f:
+                    should_send = False
+                    log.info(
+                        "GO bloqué (prix en retard): SELL prix=%.2f <= TP1=%.2f — trade inutile",
+                        current_price, tp1_f,
+                    )
+            except (TypeError, ValueError):
+                pass
     if (
         should_send
         and blocked_by == BlockedBy.data_off
@@ -687,6 +995,17 @@ def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
     ):
         should_send = False
 
+    # Enrichir les détails du score pour le GO : Room to Target, Pullback M5, Fibo (déjà dans scorer)
+    if status == DecisionStatus.go and packet.reasons_rules is not None:
+        extra_reasons = []
+        if getattr(settings, "room_to_target_enabled", False):
+            extra_reasons.append("Room jusqu'au TP1 OK")
+        if getattr(settings, "entry_timing_mode", "classic") == "pullback_m5" and packet.state.get("timing_ready"):
+            extra_reasons.append("Pullback 30-50% + rejet M5")
+        if extra_reasons:
+            packet.reasons_rules = list(packet.reasons_rules) + extra_reasons
+
+    state = packet.state or {}
     raw_message = formatter.format_message(
         symbol=symbol,
         decision=decision,
@@ -694,10 +1013,22 @@ def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
         sl=packet.sl,
         tp1=packet.tp1,
         tp2=packet.tp2,
-        direction=packet.state.get("setup_direction", "BUY"),
+        direction=state.get("setup_direction", "BUY"),
         current_price=current_price,
         market_provider=settings.market_provider,
         score_reasons=packet.reasons_rules,
+        news_state=packet.news_state,
+        spread=packet.spread,
+        spread_max=packet.spread_max,
+        atr=packet.atr,
+        atr_max=packet.atr_max,
+        rr_tp1=packet.rr_tp1,
+        rr_tp2=packet.rr_tp2,
+        bias_h1=packet.bias_h1,
+        setups_detected=packet.setups_detected,
+        timing_step_zone_ok=state.get("timing_step_zone_ok"),
+        timing_step_pullback_ok=state.get("timing_step_pullback_ok"),
+        timing_step_m5_ok=state.get("timing_step_m5_ok"),
     )
     message = raw_message
     # Coach AI uniquement si on va envoyer (économie d'API)
@@ -715,7 +1046,8 @@ def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
             date = now_utc_str[:10]
             if can_call_ai(date, prompt):
                 coach_output = build_coach_output(coach_payload)
-                if coach_output.telegram_text:
+                # NO_GO : garder raw_message (détails Bon moment, Fibo) pour le suivi
+                if coach_output.telegram_text and status != DecisionStatus.no_go:
                     message = coach_output.telegram_text
                 ai_model = coach_output.model
                 ai_input_tokens += coach_output.input_tokens
@@ -754,6 +1086,7 @@ def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
     telegram_sent = 0
     telegram_error = None
     telegram_latency_ms = None
+    telegram_skip_reason = None
     sender = TelegramSender()
 
     prealert_text = None
@@ -811,25 +1144,54 @@ def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
                 except Exception:  # noqa: BLE001
                     pass
 
+    if not settings.telegram_enabled:
+        telegram_skip_reason = "telegram_disabled"
+        log.info("Telegram désactivé (TELEGRAM_ENABLED=false), aucun message envoyé.")
+    elif not should_send:
+        telegram_skip_reason = no_send_reason_detail or "should_send_false"
+        log.info(
+            "Pas d'envoi Telegram: %s status=%s blocked_by=%s",
+            telegram_skip_reason, status.value, blocked_by.value if blocked_by else "-",
+        )
     if should_send and settings.telegram_enabled:
-        result = sender.send_message(message)
+        # NO_GO / blocages → Debug ; GO → Setup
+        debug_chat = (settings.telegram_chat_id_debug or "").strip()
+        target_chat = debug_chat if (status == DecisionStatus.no_go and debug_chat) else None
+        dest = "DEBUG" if target_chat else "MAIN"
+        log.info("Telegram envoi %s → chat=%s status=%s", dest, target_chat or settings.telegram_chat_id, status.value)
+        result = sender.send_message(message, chat_id=target_chat)
         telegram_sent = 1 if result.sent else 0
         telegram_error = result.error
         telegram_latency_ms = result.latency_ms
+        if not result.sent and result.error:
+            telegram_skip_reason = "send_failed"
+            log.warning("Telegram NON envoyé: %s", result.error)
         if telegram_sent and blocked_by == BlockedBy.data_off:
             set_data_off_alert_sent(day_paris)
         if telegram_sent and status == DecisionStatus.go:
+            dir_go = packet.state.get("setup_direction", "BUY")
+            swing_low = packet.state.get("last_swing_low")
+            swing_high = packet.state.get("last_swing_high")
+            inv_level = float(swing_low) if dir_go == "BUY" and swing_low is not None else (float(swing_high) if dir_go == "SELL" and swing_high is not None else None)
+            inv_buffer = getattr(settings, "invalidation_buffer_pts", 1.5)
             set_active_trade(
                 day_paris,
                 packet.proposed_entry or 0,
                 packet.sl or 0,
                 packet.tp1 or 0,
                 packet.tp2 or 0,
-                packet.state.get("setup_direction", "BUY"),
+                dir_go,
                 started_ts=packet.timestamps["ts_utc"],
+                invalid_level=inv_level,
+                invalid_buffer_pts=inv_buffer if inv_level is not None else None,
             )
     if prealert_text and settings.telegram_enabled:
         sender.send_message(prealert_text)
+
+    # Ne pas enregistrer alert_key DATA_OFF si l'envoi a échoué (permettre retry même heure)
+    insert_alert_key = alert_key
+    if blocked_by == BlockedBy.data_off and not telegram_sent and insert_alert_key and insert_alert_key.startswith("data_off:"):
+        insert_alert_key = None
 
     insert_signal(
         {
@@ -850,7 +1212,7 @@ def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
             "telegram_sent": telegram_sent,
             "telegram_error": telegram_error,
             "telegram_latency_ms": telegram_latency_ms,
-            "alert_key": alert_key,
+            "alert_key": insert_alert_key,
             "score_rules_json": to_json({"score": score_total, "reasons": packet.reasons_rules}),
             "ai_enabled": 1 if settings.ai_enabled else 0,
             "ai_output_json": to_json(
@@ -895,6 +1257,9 @@ def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
         data_latency_ms=packet.data_latency_ms,
         ai_latency_ms=ai_latency_ms,
         signal_key=signal_key,
+        telegram_sent=telegram_sent,
+        telegram_error=telegram_error,
+        telegram_skip_reason=telegram_skip_reason,
     )
 
 
@@ -1059,6 +1424,68 @@ def telegram_test(
     return {"sent": result.sent, "latency_ms": result.latency_ms, "error": result.error}
 
 
+@app.post("/admin/analyst-run")
+def admin_analyst_run(
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+    days: int = Query(default=7, description="Nombre de jours à analyser"),
+) -> dict:
+    """
+    Lance l'agent Analyste IA : analyse signaux, outcomes, propose des améliorations.
+    Couche isolée — n'impacte pas le flux de trading.
+    """
+    settings = get_settings()
+    if not settings.admin_token or x_admin_token != settings.admin_token:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    result = run_analyst(days=min(14, max(1, days)), save_report=True)
+    return {
+        "ok": True,
+        "summary": result.summary,
+        "recommendations": result.recommendations,
+        "input_tokens": result.input_tokens,
+        "output_tokens": result.output_tokens,
+    }
+
+
+@app.get("/admin/analyst-report")
+def admin_analyst_report(
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+) -> dict:
+    """Récupère le dernier rapport de l'agent analyste."""
+    import json
+    settings = get_settings()
+    if not settings.admin_token or x_admin_token != settings.admin_token:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT value FROM meta WHERE key = 'ai_analyst_last_report'",
+        (),
+    ).fetchone()
+    conn.close()
+    if not row or not row["value"]:
+        return {"ok": True, "report": None, "message": "Aucun rapport — lancer POST /admin/analyst-run"}
+    try:
+        return {"ok": True, "report": json.loads(row["value"])}
+    except json.JSONDecodeError:
+        return {"ok": True, "report": {"raw": row["value"]}}
+
+
+@app.get("/stats/trades-analysis")
+def stats_trades_analysis(
+    date: str | None = None,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+) -> dict:
+    """
+    Analyse des trades du jour : GO, outcomes, pertes avec raisons (score, RR, setup).
+    Paramètre optionnel date (YYYY-MM-DD). Nécessite X-Admin-Token.
+    """
+    settings = get_settings()
+    if not settings.admin_token or x_admin_token != settings.admin_token:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    from app.scripts.analyze_trades_today import analyze_today
+    day = date or datetime.now(ZoneInfo("Europe/Paris")).strftime("%Y-%m-%d")
+    return analyze_today(day)
+
+
 @app.get("/stats/summary")
 def stats_summary(
     date: str | None = None,
@@ -1179,6 +1606,7 @@ def coach_preview(
         tick = provider.get_tick(symbol)
         if tick:
             cp_preview = float(tick[0])
+    pstate = packet.state or {}
     raw_message = formatter.format_message(
         symbol=symbol,
         decision=decision,
@@ -1186,9 +1614,22 @@ def coach_preview(
         sl=packet.sl,
         tp1=packet.tp1,
         tp2=packet.tp2,
-        direction=packet.state.get("setup_direction", "BUY"),
+        direction=pstate.get("setup_direction", "BUY"),
         current_price=cp_preview,
         market_provider=settings.market_provider,
+        score_reasons=packet.reasons_rules,
+        news_state=packet.news_state,
+        spread=packet.spread,
+        spread_max=packet.spread_max,
+        atr=packet.atr,
+        atr_max=packet.atr_max,
+        rr_tp1=packet.rr_tp1,
+        rr_tp2=packet.rr_tp2,
+        bias_h1=packet.bias_h1,
+        setups_detected=packet.setups_detected,
+        timing_step_zone_ok=pstate.get("timing_step_zone_ok"),
+        timing_step_pullback_ok=pstate.get("timing_step_pullback_ok"),
+        timing_step_m5_ok=pstate.get("timing_step_m5_ok"),
     )
 
     message = raw_message

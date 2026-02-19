@@ -12,9 +12,15 @@ from app.infra.db import get_recent_signals
 from app.agents.news_agent import get_lock
 from app.agents.news_impact_agent import build_news_impact_summary
 from app.engines.news_timing import compute_news_timing
+import logging
+
 from app.engines.setup_engine import detect_setups, SetupResult, _compute_atr
 from app.engines.scorer import score_packet
 from app.engines.entry_timing_engine import get_m5_trend
+from app.engines.impulse_memory_engine import compute_impulse_memory
+from app.engines.range_engine import evaluate_range_indicators
+
+log = logging.getLogger(__name__)
 
 
 SESSION_WINDOWS = [
@@ -110,7 +116,9 @@ def build_decision_packet(provider, symbol: str) -> DecisionPacket:
         settings.market_close_end,
     )
     spread = provider.get_spread(symbol)
-    candles_m15 = provider.get_candles(symbol, settings.tf_signal, 80)
+    m15_bars = getattr(settings, "m15_fetch_bars", 80)
+    candles_m15 = provider.get_candles(symbol, settings.tf_signal, m15_bars)
+    log.info("M15 candles fetched = %d", len(candles_m15))
     candles_h1 = provider.get_candles(symbol, settings.tf_context, 100)
     try:
         candles_m5 = provider.get_candles(symbol, "M5", 48) if hasattr(provider, "get_candles") else []
@@ -157,6 +165,12 @@ def build_decision_packet(provider, symbol: str) -> DecisionPacket:
         sources_used.append("NEWS_PROVIDER_DOWN")
 
     atr = _compute_atr(candles_m15) if candles_m15 else 1.1
+    impulse_atr_mult = getattr(settings, "impulse_atr_mult", 1.8)
+    impulse_memory = (
+        compute_impulse_memory(candles_m15, impulse_atr_mult=impulse_atr_mult)
+        if candles_m15 and len(candles_m15) >= 15
+        else None
+    )
     data_latency_ms = 9999
     if candles_m15:
         last = candles_m15[-1]
@@ -166,8 +180,49 @@ def build_decision_packet(provider, symbol: str) -> DecisionPacket:
             if data_latency_ms < 0:
                 data_latency_ms = 0
 
-    def _make_packet(s: SetupResult) -> DecisionPacket:
+    def _make_packet(s: SetupResult, candles_m15: Optional[list] = None, candles_m5: Optional[list] = None) -> DecisionPacket:
         bias = bias_map.get(s.structure_h1, Bias.up)
+        base_state = {
+            "daily_budget_used": 0.0,
+            "cooldown_ok": True,
+            "setup_direction": s.direction,
+            "setup_bar_ts": s.bar_ts,
+            "setup_type": s.setup_type,
+            "timing_ready": s.timing_ready,
+            "structure_h1": s.structure_h1,
+            "entry_timing_reason": s.entry_timing_reason,
+            "timing_step_zone_ok": getattr(s, "timing_step_zone_ok", None),
+            "timing_step_pullback_ok": getattr(s, "timing_step_pullback_ok", None),
+            "timing_step_m5_ok": getattr(s, "timing_step_m5_ok", None),
+            "last_swing_low": getattr(s, "last_swing_low", None),
+            "last_swing_high": getattr(s, "last_swing_high", None),
+            "recent_m15_trend": recent_m15_trend,
+            "m5_trend": get_m5_trend(candles_m5, s.direction),
+            "impulse_memory": (
+                {
+                    "last_impulse_dir": impulse_memory.last_impulse_dir,
+                    "last_impulse_ts_utc": impulse_memory.last_impulse_ts_utc,
+                    "impulse_range_pts": impulse_memory.impulse_range_pts,
+                    "impulse_anchor_price": impulse_memory.impulse_anchor_price,
+                    "key_levels": impulse_memory.key_levels,
+                }
+                if impulse_memory
+                else None
+            ),
+        }
+        if s.structure_h1 == "RANGE" and candles_m15:
+            range_indicators = evaluate_range_indicators(
+                candles_m15,
+                s.direction,
+                s.entry,
+                getattr(s, "last_swing_low", None),
+                getattr(s, "last_swing_high", None),
+                atr,
+                s.timing_ready,
+                s.setup_type,
+                candles_m5=candles_m5,
+            )
+            base_state.update(range_indicators)
         return DecisionPacket(
             session_ok=session_ok,
             news_lock=news_lock,
@@ -234,18 +289,7 @@ def build_decision_packet(provider, symbol: str) -> DecisionPacket:
                     else None
                 ),
             },
-            state={
-                "daily_budget_used": 0.0,
-                "cooldown_ok": True,
-                "setup_direction": s.direction,
-                "setup_bar_ts": s.bar_ts,
-                "setup_type": s.setup_type,
-                "timing_ready": s.timing_ready,
-                "structure_h1": s.structure_h1,
-                "entry_timing_reason": s.entry_timing_reason,
-                "recent_m15_trend": recent_m15_trend,
-                "m5_trend": get_m5_trend(candles_m5, s.direction),
-            },
+            state=base_state,
             timestamps={
                 "ts_utc": now_utc.isoformat(),
                 "ts_paris": now_paris.isoformat(),
@@ -253,8 +297,8 @@ def build_decision_packet(provider, symbol: str) -> DecisionPacket:
             data_latency_ms=data_latency_ms,
         )
 
-    packet_buy = _make_packet(setup_buy)
-    packet_sell = _make_packet(setup_sell)
+    packet_buy = _make_packet(setup_buy, candles_m15=candles_m15, candles_m5=candles_m5)
+    packet_sell = _make_packet(setup_sell, candles_m15=candles_m15, candles_m5=candles_m5)
     score_buy, _ = score_packet(packet_buy)
     score_sell, _ = score_packet(packet_sell)
     if score_buy > score_sell:

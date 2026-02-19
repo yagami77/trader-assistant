@@ -36,6 +36,7 @@ def main() -> None:
     parser.add_argument("--interval", type=int, default=60, help="Intervalle en secondes entre chaque appel")
     parser.add_argument("--symbol", type=str, default="XAUUSD", help="Symbole à analyser")
     parser.add_argument("--timeframe", type=str, default="M15", help="Timeframe (non utilisé par l'API)")
+    parser.add_argument("--once", action="store_true", help="Un seul appel /analyze puis arrêt")
     args = parser.parse_args()
 
     url = API_URL_DEFAULT.rstrip("/") + "/analyze"
@@ -52,7 +53,15 @@ def main() -> None:
             data = resp.json()
             status = data.get("decision", {}).get("status", "?")
             blocked = data.get("decision", {}).get("blocked_by", "")
-            log.info("Analyze OK: status=%s blocked_by=%s", status, blocked or "-")
+            tg_sent = data.get("telegram_sent", 0)
+            tg_err = data.get("telegram_error", "")
+            tg_skip = data.get("telegram_skip_reason", "")
+            log.info(
+                "Analyze OK: status=%s blocked_by=%s telegram_sent=%s%s%s",
+                status, blocked or "-", tg_sent,
+                f" err={tg_err}" if tg_err else "",
+                f" skip={tg_skip}" if tg_skip else "",
+            )
         except httpx.ConnectError as e:
             log.warning("API injoignable: %s", e)
         except httpx.HTTPStatusError as e:
